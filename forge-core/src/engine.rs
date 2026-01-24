@@ -1,90 +1,149 @@
-//! Inference engine - orchestrates forward passes
+//! Inference engine - orchestrates forward passes with real model execution
+//!
+//! This module implements the core inference loop using actual LLaMA models
+//! from candle-transformers.
 
-use anyhow::{Result, anyhow};
-use candle_core::{Device, DType, Tensor};
-use std::sync::Arc;
+use anyhow::{anyhow, Result};
+use candle_core::{DType, Device, Tensor};
+use candle_transformers::models::llama::{Cache, LlamaEosToks};
+use candle_transformers::generation::LogitsProcessor;
 use parking_lot::Mutex;
+use std::sync::Arc;
+use std::io::Write;
+use tracing::{info, debug};
 
-use crate::batcher::Sampler;
-use crate::request::{SamplingParams, InferenceRequest, InferenceResponse, FinishReason};
-use crate::kv_cache::PagedKVCache;
-use crate::scheduler::Scheduler;
+use crate::model::{LoadedModel, ModelConfig, TokenOutputStream, create_logits_processor, load_model};
+use crate::request::SamplingParams;
 
 /// Configuration for the inference engine
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    pub vocab_size: usize,
-    pub hidden_size: usize,
-    pub num_layers: usize,
-    pub num_heads: usize,
-    pub head_dim: usize,
+    /// Model configuration
+    pub model_config: ModelConfig,
+    /// Maximum sequence length
     pub max_seq_len: usize,
-    pub dtype: DType,
+    /// Repeat penalty (1.0 = no penalty)
+    pub repeat_penalty: f32,
+    /// Context size for repeat penalty
+    pub repeat_last_n: usize,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            vocab_size: 32000,
-            hidden_size: 4096,
-            num_layers: 32,
-            num_heads: 32,
-            head_dim: 128,
+            model_config: ModelConfig::default(),
             max_seq_len: 4096,
-            dtype: DType::F32,
+            repeat_penalty: 1.1,
+            repeat_last_n: 64,
         }
     }
 }
 
-/// Inference engine that orchestrates model execution
+impl EngineConfig {
+    pub fn with_model(model_config: ModelConfig) -> Self {
+        Self {
+            model_config,
+            ..Default::default()
+        }
+    }
+}
+
+/// Engine statistics
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineStats {
+    pub device: String,
+    pub model_id: String,
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub num_layers: usize,
+    pub dtype: String,
+    pub max_seq_len: usize,
+}
+
+/// Result of a single generation
+#[derive(Debug, Clone)]
+pub struct GenerationResult {
+    /// Generated tokens
+    pub tokens: Vec<u32>,
+    /// Generated text
+    pub text: String,
+    /// Number of prompt tokens
+    pub prompt_tokens: usize,
+    /// Number of generated tokens
+    pub generated_tokens: usize,
+    /// Tokens per second
+    pub tokens_per_second: f64,
+    /// Finish reason
+    pub finish_reason: FinishReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum FinishReason {
+    Length,
+    Stop,
+    Error,
+}
+
+/// Inference engine that performs actual model execution
 pub struct InferenceEngine {
     config: EngineConfig,
     device: Device,
-    sampler: Mutex<Sampler>,
-    kv_cache: Arc<Mutex<PagedKVCache>>,
-    scheduler: Arc<Scheduler>,
+    model: Arc<LoadedModel>,
 }
 
 impl InferenceEngine {
-    /// Create a new inference engine
+    /// Create a new inference engine with the specified model
     pub fn new(config: EngineConfig, device: Device) -> Result<Self> {
-        let kv_cache = Arc::new(Mutex::new(PagedKVCache::new(
-            config.num_layers,
-            config.num_heads,
-            config.head_dim,
-            1024, // total pages
-            config.dtype,
-            device.clone(),
-        )?));
-
-        let scheduler = Arc::new(Scheduler::new(kv_cache.clone()));
+        info!("Initializing inference engine...");
+        let model = load_model(&config.model_config, &device)?;
 
         Ok(Self {
             config,
             device,
-            sampler: Mutex::new(Sampler::new(42)),
-            kv_cache,
-            scheduler,
+            model: Arc::new(model),
         })
     }
 
-    /// Create with default config for CPU
+    /// Create with default config for CPU using SmolLM-135M (small, fast model)
     pub fn new_cpu() -> Result<Self> {
-        Self::new(EngineConfig::default(), Device::Cpu)
+        let config = EngineConfig::with_model(ModelConfig::smollm_135m());
+        Self::new(config, Device::Cpu)
+    }
+
+    /// Create with TinyLlama 1.1B on CPU
+    pub fn new_cpu_tinyllama() -> Result<Self> {
+        let config = EngineConfig::with_model(ModelConfig::tinyllama());
+        Self::new(config, Device::Cpu)
+    }
+
+    /// Create with SmolLM-360M on CPU
+    pub fn new_cpu_smollm_360m() -> Result<Self> {
+        let config = EngineConfig::with_model(ModelConfig::smollm_360m());
+        Self::new(config, Device::Cpu)
     }
 
     /// Create with Metal backend (macOS)
     #[cfg(feature = "metal")]
     pub fn new_metal() -> Result<Self> {
         let device = Device::new_metal(0)?;
-        Self::new(EngineConfig::default(), device)
+        let config = EngineConfig::with_model(ModelConfig::smollm_135m());
+        Self::new(config, device)
+    }
+
+    /// Create with Metal backend using TinyLlama
+    #[cfg(feature = "metal")]
+    pub fn new_metal_tinyllama() -> Result<Self> {
+        let device = Device::new_metal(0)?;
+        let config = EngineConfig::with_model(ModelConfig::tinyllama());
+        Self::new(config, device)
     }
 
     /// Create with CUDA backend
     #[cfg(feature = "cuda")]
     pub fn new_cuda(device_id: usize) -> Result<Self> {
         let device = Device::new_cuda(device_id)?;
-        Self::new(EngineConfig::default(), device)
+        let config = EngineConfig::with_model(ModelConfig::smollm_135m());
+        Self::new(config, device)
     }
 
     /// Get the device being used
@@ -92,67 +151,265 @@ impl InferenceEngine {
         &self.device
     }
 
-    /// Generate text from a prompt (simplified for demo)
-    pub fn generate(&self, tokens: &[u32], params: &SamplingParams) -> Result<Vec<u32>> {
-        let mut output_tokens = Vec::new();
-        let mut input_tokens = tokens.to_vec();
-
-        for _ in 0..params.max_tokens {
-            // Create mock logits (in real impl, this would be model forward pass)
-            let logits = self.mock_forward(&input_tokens)?;
-
-            // Sample next token
-            let next_token = self.sampler.lock().sample(&logits, params)?;
-
-            // Check for stop token
-            if params.stop_tokens.contains(&next_token) {
-                break;
-            }
-
-            output_tokens.push(next_token);
-            input_tokens.push(next_token);
-        }
-
-        Ok(output_tokens)
+    /// Get the loaded model
+    pub fn model(&self) -> &LoadedModel {
+        &self.model
     }
 
-    /// Mock forward pass - returns random logits
-    /// Replace with actual model inference
-    fn mock_forward(&self, _tokens: &[u32]) -> Result<Tensor> {
-        // Generate random logits for demonstration
-        let logits = Tensor::randn(
-            0.0f32,
-            1.0,
-            (1, self.config.vocab_size),
-            &self.device,
-        )?;
-        Ok(logits)
+    /// Encode a prompt to tokens
+    pub fn encode(&self, prompt: &str) -> Result<Vec<u32>> {
+        self.model.tokenizer
+            .encode(prompt, true)
+            .map_err(|e| anyhow!("Tokenization error: {}", e))
+            .map(|enc| enc.get_ids().to_vec())
+    }
+
+    /// Decode tokens to text
+    pub fn decode(&self, tokens: &[u32]) -> Result<String> {
+        self.model.tokenizer
+            .decode(tokens, true)
+            .map_err(|e| anyhow!("Decode error: {}", e))
+    }
+
+    /// Generate text from a prompt
+    pub fn generate(&self, prompt: &str, params: &SamplingParams) -> Result<GenerationResult> {
+        let tokens = self.encode(prompt)?;
+        self.generate_from_tokens(&tokens, params)
+    }
+
+    /// Generate text from tokens
+    pub fn generate_from_tokens(&self, prompt_tokens: &[u32], params: &SamplingParams) -> Result<GenerationResult> {
+        let prompt_len = prompt_tokens.len();
+        let mut tokens = prompt_tokens.to_vec();
+        let mut generated_tokens = Vec::new();
+
+        // Create KV cache for this generation
+        let mut cache = self.model.new_cache()?;
+
+        // Create logits processor
+        let mut logits_processor = create_logits_processor(
+            params.seed.unwrap_or(42),
+            params.temperature,
+            params.top_p,
+            params.top_k,
+        );
+
+        let start_time = std::time::Instant::now();
+        let mut index_pos = 0;
+
+        for i in 0..params.max_tokens {
+            // Determine context size (full for first token, 1 for subsequent)
+            let (context_size, context_index) = if cache.use_kv_cache && i > 0 {
+                (1, index_pos)
+            } else {
+                (tokens.len(), 0)
+            };
+
+            // Get the context tokens
+            let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
+            let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
+
+            // Forward pass
+            let logits = self.model.model.forward(&input, context_index, &mut cache)
+                .map_err(|e| anyhow!("Forward pass error: {}", e))?;
+            let logits = logits.squeeze(0).map_err(|e| anyhow!("Squeeze error: {}", e))?;
+
+            // Apply repeat penalty
+            let logits = if self.config.repeat_penalty != 1.0 {
+                let start_at = tokens.len().saturating_sub(self.config.repeat_last_n);
+                candle_transformers::utils::apply_repeat_penalty(
+                    &logits,
+                    self.config.repeat_penalty,
+                    &tokens[start_at..],
+                ).map_err(|e| anyhow!("Repeat penalty error: {}", e))?
+            } else {
+                logits
+            };
+
+            index_pos += ctxt.len();
+
+            // Sample next token
+            let next_token = logits_processor.sample(&logits)
+                .map_err(|e| anyhow!("Sampling error: {}", e))?;
+
+            // Check for stop tokens
+            if params.stop_tokens.contains(&next_token) {
+                return Ok(GenerationResult {
+                    tokens: generated_tokens.clone(),
+                    text: self.decode(&generated_tokens)?,
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_tokens.len(),
+                    tokens_per_second: generated_tokens.len() as f64 / start_time.elapsed().as_secs_f64(),
+                    finish_reason: FinishReason::Stop,
+                });
+            }
+
+            // Check for EOS token
+            let is_eos = match &self.model.eos_token_id {
+                Some(LlamaEosToks::Single(eos)) if next_token == *eos => true,
+                Some(LlamaEosToks::Multiple(eos_ids)) if eos_ids.contains(&next_token) => true,
+                _ => false,
+            };
+
+            if is_eos {
+                return Ok(GenerationResult {
+                    tokens: generated_tokens.clone(),
+                    text: self.decode(&generated_tokens)?,
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_tokens.len(),
+                    tokens_per_second: generated_tokens.len() as f64 / start_time.elapsed().as_secs_f64(),
+                    finish_reason: FinishReason::Stop,
+                });
+            }
+
+            generated_tokens.push(next_token);
+            tokens.push(next_token);
+        }
+
+        let elapsed = start_time.elapsed();
+        let tokens_per_second = generated_tokens.len() as f64 / elapsed.as_secs_f64();
+
+        Ok(GenerationResult {
+            tokens: generated_tokens.clone(),
+            text: self.decode(&generated_tokens)?,
+            prompt_tokens: prompt_len,
+            generated_tokens: generated_tokens.len(),
+            tokens_per_second,
+            finish_reason: FinishReason::Length,
+        })
+    }
+
+    /// Generate with streaming output
+    pub fn generate_streaming<F>(&self, prompt: &str, params: &SamplingParams, mut callback: F) -> Result<GenerationResult>
+    where
+        F: FnMut(&str),
+    {
+        let prompt_tokens = self.encode(prompt)?;
+        let prompt_len = prompt_tokens.len();
+        let mut tokens = prompt_tokens.clone();
+        let mut generated_tokens = Vec::new();
+
+        // Create KV cache for this generation
+        let mut cache = self.model.new_cache()?;
+
+        // Create logits processor
+        let mut logits_processor = create_logits_processor(
+            params.seed.unwrap_or(42),
+            params.temperature,
+            params.top_p,
+            params.top_k,
+        );
+
+        // Create token output stream for incremental decoding
+        let mut token_stream = TokenOutputStream::new(self.model.tokenizer.clone());
+
+        let start_time = std::time::Instant::now();
+        let mut index_pos = 0;
+
+        for i in 0..params.max_tokens {
+            let (context_size, context_index) = if cache.use_kv_cache && i > 0 {
+                (1, index_pos)
+            } else {
+                (tokens.len(), 0)
+            };
+
+            let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
+            let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
+
+            let logits = self.model.model.forward(&input, context_index, &mut cache)
+                .map_err(|e| anyhow!("Forward pass error: {}", e))?;
+            let logits = logits.squeeze(0).map_err(|e| anyhow!("Squeeze error: {}", e))?;
+
+            let logits = if self.config.repeat_penalty != 1.0 {
+                let start_at = tokens.len().saturating_sub(self.config.repeat_last_n);
+                candle_transformers::utils::apply_repeat_penalty(
+                    &logits,
+                    self.config.repeat_penalty,
+                    &tokens[start_at..],
+                ).map_err(|e| anyhow!("Repeat penalty error: {}", e))?
+            } else {
+                logits
+            };
+
+            index_pos += ctxt.len();
+
+            let next_token = logits_processor.sample(&logits)
+                .map_err(|e| anyhow!("Sampling error: {}", e))?;
+
+            // Check for stop tokens
+            if params.stop_tokens.contains(&next_token) {
+                // Flush remaining tokens
+                if let Ok(Some(text)) = token_stream.decode_rest() {
+                    callback(&text);
+                }
+                return Ok(GenerationResult {
+                    tokens: generated_tokens.clone(),
+                    text: token_stream.decode_all()?,
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_tokens.len(),
+                    tokens_per_second: generated_tokens.len() as f64 / start_time.elapsed().as_secs_f64(),
+                    finish_reason: FinishReason::Stop,
+                });
+            }
+
+            // Check for EOS token
+            let is_eos = match &self.model.eos_token_id {
+                Some(LlamaEosToks::Single(eos)) if next_token == *eos => true,
+                Some(LlamaEosToks::Multiple(eos_ids)) if eos_ids.contains(&next_token) => true,
+                _ => false,
+            };
+
+            if is_eos {
+                if let Ok(Some(text)) = token_stream.decode_rest() {
+                    callback(&text);
+                }
+                return Ok(GenerationResult {
+                    tokens: generated_tokens.clone(),
+                    text: token_stream.decode_all()?,
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_tokens.len(),
+                    tokens_per_second: generated_tokens.len() as f64 / start_time.elapsed().as_secs_f64(),
+                    finish_reason: FinishReason::Stop,
+                });
+            }
+
+            generated_tokens.push(next_token);
+            tokens.push(next_token);
+
+            // Stream output
+            if let Ok(Some(text)) = token_stream.next_token(next_token) {
+                callback(&text);
+            }
+        }
+
+        // Flush remaining tokens
+        if let Ok(Some(text)) = token_stream.decode_rest() {
+            callback(&text);
+        }
+
+        let elapsed = start_time.elapsed();
+        let tokens_per_second = generated_tokens.len() as f64 / elapsed.as_secs_f64();
+
+        Ok(GenerationResult {
+            tokens: generated_tokens,
+            text: token_stream.decode_all()?,
+            prompt_tokens: prompt_len,
+            generated_tokens: token_stream.get_tokens().len(),
+            tokens_per_second,
+            finish_reason: FinishReason::Length,
+        })
     }
 
     /// Get engine statistics
     pub fn stats(&self) -> EngineStats {
-        let cache_stats = self.kv_cache.lock().stats();
-        let scheduler_stats = self.scheduler.stats();
-
         EngineStats {
             device: format!("{:?}", self.device),
-            vocab_size: self.config.vocab_size,
-            num_layers: self.config.num_layers,
-            cache_pages_total: cache_stats.total_pages,
-            cache_pages_used: cache_stats.used_pages,
-            pending_requests: scheduler_stats.pending_requests,
-            running_requests: scheduler_stats.running_requests,
+            model_id: self.config.model_config.model_id.clone(),
+            vocab_size: self.model.vocab_size(),
+            hidden_size: self.model.hidden_size(),
+            num_layers: self.model.num_layers(),
+            dtype: format!("{:?}", self.model.dtype),
+            max_seq_len: self.config.max_seq_len,
         }
     }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct EngineStats {
-    pub device: String,
-    pub vocab_size: usize,
-    pub num_layers: usize,
-    pub cache_pages_total: usize,
-    pub cache_pages_used: usize,
-    pub pending_requests: usize,
-    pub running_requests: usize,
 }

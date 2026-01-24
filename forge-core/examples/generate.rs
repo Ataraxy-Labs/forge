@@ -1,0 +1,84 @@
+//! Example: Direct text generation using Forge
+//!
+//! Run with: cargo run --example generate -- --prompt "Hello, my name is"
+
+use anyhow::Result;
+use forge_core::{InferenceEngine, SamplingParams, EngineConfig, ModelConfig};
+use std::io::Write;
+
+fn main() -> Result<()> {
+    // Parse args
+    let args: Vec<String> = std::env::args().collect();
+    let prompt = args.iter()
+        .position(|a| a == "--prompt")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str())
+        .unwrap_or("The best programming language is");
+
+    let max_tokens = args.iter()
+        .position(|a| a == "--max-tokens")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+
+    let model_id = args.iter()
+        .position(|a| a == "--model")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str())
+        .unwrap_or("HuggingFaceTB/SmolLM2-135M");
+
+    println!("Forge - LLM Inference Engine");
+    println!("Model: {}", model_id);
+    println!("Prompt: {}", prompt);
+    println!("Max tokens: {}", max_tokens);
+    println!();
+
+    // Create engine
+    println!("Loading model...");
+    let model_config = ModelConfig {
+        model_id: model_id.to_string(),
+        revision: "main".to_string(),
+        dtype: candle_core::DType::F32,
+        use_flash_attn: false,
+    };
+    let engine_config = EngineConfig::with_model(model_config);
+    let engine = InferenceEngine::new(engine_config, candle_core::Device::Cpu)?;
+
+    let stats = engine.stats();
+    println!("Model loaded!");
+    println!("  Vocab size: {}", stats.vocab_size);
+    println!("  Hidden size: {}", stats.hidden_size);
+    println!("  Layers: {}", stats.num_layers);
+    println!();
+
+    // Generate with streaming
+    println!("Generating...");
+    println!("---");
+    print!("{}", prompt);
+    std::io::stdout().flush()?;
+
+    let params = SamplingParams {
+        max_tokens,
+        temperature: 0.8,
+        top_p: Some(0.9),
+        top_k: None,
+        stop_tokens: vec![],
+        seed: Some(42),
+    };
+
+    let result = engine.generate_streaming(prompt, &params, |text| {
+        print!("{}", text);
+        std::io::stdout().flush().ok();
+    })?;
+
+    println!();
+    println!("---");
+    println!();
+    println!("Stats:");
+    println!("  Prompt tokens: {}", result.prompt_tokens);
+    println!("  Generated tokens: {}", result.generated_tokens);
+    println!("  Speed: {:.2} tok/s", result.tokens_per_second);
+    println!("  Finish reason: {:?}", result.finish_reason);
+
+    Ok(())
+}

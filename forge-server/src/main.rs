@@ -1,10 +1,12 @@
+//! Forge Server - OpenAI-compatible HTTP API for the Forge inference engine
+
 use axum::{
     extract::State,
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
-use forge_core::{InferenceEngine, SamplingParams, EngineStats};
+use forge_core::{InferenceEngine, SamplingParams, EngineStats, EngineConfig, ModelConfig, FinishReason};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
@@ -29,9 +31,13 @@ struct CompletionRequest {
     top_k: Option<usize>,
     #[serde(default)]
     stop: Vec<String>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    stream: bool,
 }
 
-fn default_max_tokens() -> usize { 50 }
+fn default_max_tokens() -> usize { 100 }
 fn default_temperature() -> f64 { 0.7 }
 
 #[derive(Debug, Serialize)]
@@ -81,34 +87,32 @@ async fn completions(
     State(state): State<AppState>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Json<CompletionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    info!("Completion request: prompt='{}' max_tokens={}", req.prompt, req.max_tokens);
-
-    // Simple tokenization (in real impl, use proper tokenizer)
-    let tokens: Vec<u32> = req.prompt.chars().map(|c| c as u32).collect();
-    let prompt_tokens = tokens.len();
+    info!("Completion request: prompt='{}' max_tokens={}",
+          if req.prompt.len() > 50 { &req.prompt[..50] } else { &req.prompt },
+          req.max_tokens);
 
     let params = SamplingParams {
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
         top_k: req.top_k,
-        stop_tokens: vec![],
+        stop_tokens: vec![], // Would need tokenizer to convert stop strings to tokens
+        seed: req.seed,
     };
 
     // Generate
-    let output_tokens = state.engine.generate(&tokens, &params)
+    let result = state.engine.generate(&req.prompt, &params)
         .map_err(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
                 error: e.to_string(),
             }))
         })?;
 
-    // Convert tokens back to text (simplified - just use token IDs as chars)
-    let text: String = output_tokens.iter()
-        .filter_map(|&t| char::from_u32(t))
-        .collect();
-
-    let completion_tokens = output_tokens.len();
+    let finish_reason = match result.finish_reason {
+        FinishReason::Stop => "stop",
+        FinishReason::Length => "length",
+        FinishReason::Error => "error",
+    };
 
     let response = CompletionResponse {
         id: format!("cmpl-{}", uuid_simple()),
@@ -117,18 +121,22 @@ async fn completions(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs(),
-        model: "forge-mock".to_string(),
+        model: state.engine.stats().model_id,
         choices: vec![Choice {
             index: 0,
-            text,
-            finish_reason: "length".to_string(),
+            text: result.text,
+            finish_reason: finish_reason.to_string(),
         }],
         usage: Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens: result.prompt_tokens,
+            completion_tokens: result.generated_tokens,
+            total_tokens: result.prompt_tokens + result.generated_tokens,
         },
     };
+
+    info!("Generated {} tokens at {:.2} tok/s",
+          result.generated_tokens,
+          result.tokens_per_second);
 
     Ok(Json(response))
 }
@@ -139,6 +147,24 @@ fn uuid_simple() -> String {
     format!("{:x}{:x}", now.as_secs(), now.subsec_nanos())
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelRequest {
+    model_id: Option<String>,
+}
+
+async fn list_models(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let stats = state.engine.stats();
+    Json(serde_json::json!({
+        "object": "list",
+        "data": [{
+            "id": stats.model_id,
+            "object": "model",
+            "owned_by": "forge",
+            "permission": []
+        }]
+    }))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize logging
@@ -146,11 +172,34 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(Level::INFO)
         .init();
 
+    // Parse model selection from environment or use default
+    let model_id = std::env::var("FORGE_MODEL")
+        .unwrap_or_else(|_| "HuggingFaceTB/SmolLM2-135M".to_string());
+
+    info!("Selected model: {}", model_id);
+
+    // Create model config
+    let model_config = ModelConfig {
+        model_id: model_id.clone(),
+        revision: "main".to_string(),
+        dtype: candle_core::DType::F32,
+        use_flash_attn: false,
+    };
+
+    // Create engine config
+    let engine_config = EngineConfig::with_model(model_config);
+
     // Create inference engine
     info!("Initializing inference engine...");
+    let engine = InferenceEngine::new(engine_config, candle_core::Device::Cpu)?;
 
-    let engine = InferenceEngine::new_cpu()?;
-    info!("Engine initialized: {:?}", engine.stats());
+    let stats = engine.stats();
+    info!("Engine initialized successfully!");
+    info!("  Model: {}", stats.model_id);
+    info!("  Vocab size: {}", stats.vocab_size);
+    info!("  Hidden size: {}", stats.hidden_size);
+    info!("  Layers: {}", stats.num_layers);
+    info!("  Device: {}", stats.device);
 
     let state = AppState {
         engine: Arc::new(engine),
@@ -160,14 +209,20 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/v1/completions", post(completions))
+        .route("/v1/models", get(list_models))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
     // Start server
-    let addr = "0.0.0.0:8080";
+    let port = std::env::var("FORGE_PORT")
+        .unwrap_or_else(|_| "8080".to_string())
+        .parse::<u16>()
+        .unwrap_or(8080);
+
+    let addr = format!("0.0.0.0:{}", port);
     info!("Starting server on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())

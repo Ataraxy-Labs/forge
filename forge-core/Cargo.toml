@@ -18,9 +18,12 @@ crossbeam-channel = { workspace = true }
 dashmap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-rand = "0.8"
+hf-hub = { workspace = true }
+tokenizers = { workspace = true }
+rand = { workspace = true }
 
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+flash-attn = ["candle-transformers/flash-attn"]

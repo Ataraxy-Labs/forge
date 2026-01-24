@@ -80,7 +80,7 @@ impl Sampler {
         let filtered: Vec<(usize, f32)> = indexed.into_iter().take(cutoff_idx).collect();
         let sum: f32 = filtered.iter().map(|(_, p)| p).sum();
 
-        let r: f32 = self.rng.gen::<f32>() * sum;
+        let r: f32 = self.rng.random::<f32>() * sum;
         let mut cumsum = 0.0;
         for (idx, p) in filtered {
             cumsum += p;
@@ -97,7 +97,7 @@ impl Sampler {
         indexed.truncate(top_k);
 
         let sum: f32 = indexed.iter().map(|(_, p)| p).sum();
-        let r: f32 = self.rng.gen::<f32>() * sum;
+        let r: f32 = self.rng.random::<f32>() * sum;
 
         let mut cumsum = 0.0;
         for (idx, p) in indexed {
@@ -110,7 +110,7 @@ impl Sampler {
     }
 
     fn sample_multinomial(&mut self, probs: &[f32]) -> u32 {
-        let r: f32 = self.rng.gen();
+        let r: f32 = self.rng.random::<f32>();
         let mut cumsum = 0.0;
         for (i, p) in probs.iter().enumerate() {
             cumsum += p;

@@ -22,6 +22,7 @@ pub struct SamplingParams {
     pub top_p: Option<f64>,
     pub top_k: Option<usize>,
     pub stop_tokens: Vec<u32>,
+    pub seed: Option<u64>,
 }
 
 impl Default for SamplingParams {
@@ -32,6 +33,7 @@ impl Default for SamplingParams {
             top_p: Some(0.9),
             top_k: None,
             stop_tokens: vec![],
+            seed: None,
         }
     }
 }
