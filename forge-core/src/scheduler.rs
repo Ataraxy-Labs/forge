@@ -41,7 +41,7 @@ impl Scheduler {
     pub fn get_next_batch(&self) -> Option<ScheduledBatch> {
         let mut running = self.running_requests.lock();
         let mut pending = self.pending_queue.lock();
-        let mut kv_cache = self.kv_cache.lock();
+        let kv_cache = self.kv_cache.lock();
 
         // Remove finished requests and free their pages
         running.retain(|req| {
@@ -168,7 +168,7 @@ impl Scheduler {
 
     fn create_batch(
         &self,
-        running: &[RequestState],
+        _running: &[RequestState],
         request_ids: Vec<u64>,
         decode_tokens: usize,
         prefill_tokens: usize,
@@ -187,7 +187,7 @@ impl Scheduler {
     /// Update request state after inference step
     pub fn update_requests(&self, generated_tokens: Vec<(u64, u32)>) {
         let mut running = self.running_requests.lock();
-        let mut kv_cache = self.kv_cache.lock();
+        let kv_cache = self.kv_cache.lock();
 
         for (req_id, token) in generated_tokens {
             if let Some(req) = running.iter_mut().find(|r| r.request.id == req_id) {

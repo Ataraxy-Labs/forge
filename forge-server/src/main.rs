@@ -30,10 +30,12 @@ struct CompletionRequest {
     #[serde(default)]
     top_k: Option<usize>,
     #[serde(default)]
+    #[allow(dead_code)]
     stop: Vec<String>,
     #[serde(default)]
     seed: Option<u64>,
     #[serde(default)]
+    #[allow(dead_code)]
     stream: bool,
 }
 
@@ -148,6 +150,7 @@ fn uuid_simple() -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ModelRequest {
     model_id: Option<String>,
 }

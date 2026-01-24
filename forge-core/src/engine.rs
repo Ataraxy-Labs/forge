@@ -4,13 +4,10 @@
 //! from candle-transformers.
 
 use anyhow::{anyhow, Result};
-use candle_core::{DType, Device, Tensor};
-use candle_transformers::models::llama::{Cache, LlamaEosToks};
-use candle_transformers::generation::LogitsProcessor;
-use parking_lot::Mutex;
+use candle_core::{Device, Tensor};
+use candle_transformers::models::llama::LlamaEosToks;
 use std::sync::Arc;
-use std::io::Write;
-use tracing::{info, debug};
+use tracing::info;
 
 use crate::model::{LoadedModel, ModelConfig, TokenOutputStream, create_logits_processor, load_model};
 use crate::request::SamplingParams;

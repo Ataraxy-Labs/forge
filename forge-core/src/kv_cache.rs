@@ -11,7 +11,7 @@ pub const PAGE_SIZE: usize = 16;
 /// rather than pre-allocating the full context window per request
 pub struct PagedKVCache {
     /// Number of layers in the model
-    num_layers: usize,
+    _num_layers: usize,
     /// Number of attention heads
     num_heads: usize,
     /// Size of each attention head
@@ -26,8 +26,8 @@ pub struct PagedKVCache {
     total_pages: usize,
     /// Actual K/V tensors per layer
     /// Shape: [num_layers, total_pages, PAGE_SIZE, num_heads, head_dim]
-    k_cache: Vec<Tensor>,
-    v_cache: Vec<Tensor>,
+    _k_cache: Vec<Tensor>,
+    _v_cache: Vec<Tensor>,
 }
 
 impl PagedKVCache {
@@ -63,15 +63,15 @@ impl PagedKVCache {
         let free_pages = (0..total_pages).collect();
 
         Ok(Self {
-            num_layers,
+            _num_layers: num_layers,
             num_heads,
             head_dim,
             dtype,
             device,
             free_pages: Arc::new(Mutex::new(free_pages)),
             total_pages,
-            k_cache,
-            v_cache,
+            _k_cache: k_cache,
+            _v_cache: v_cache,
         })
     }
 
@@ -99,11 +99,11 @@ impl PagedKVCache {
     /// Write K/V values to a specific page
     pub fn write_kv(
         &mut self,
-        layer_idx: usize,
-        page_id: usize,
-        token_offset: usize,
-        k: &Tensor,
-        v: &Tensor,
+        _layer_idx: usize,
+        _page_id: usize,
+        _token_offset: usize,
+        _k: &Tensor,
+        _v: &Tensor,
     ) -> Result<()> {
         // k, v shape: [batch, num_heads, head_dim]
         // We write to: [page_id, token_offset, :, :]
@@ -118,16 +118,15 @@ impl PagedKVCache {
     /// Returns concatenated K/V from all pages used by a request
     pub fn read_kv(
         &self,
-        layer_idx: usize,
-        page_ids: &[usize],
+        _layer_idx: usize,
+        _page_ids: &[usize],
         seq_len: usize,
     ) -> Result<(Tensor, Tensor)> {
         // Gather K/V from multiple pages
         // Output shape: [seq_len, num_heads, head_dim]
-        
-        let num_pages = page_ids.len();
-        let full_pages = seq_len / PAGE_SIZE;
-        let remainder = seq_len % PAGE_SIZE;
+
+        // TODO: Implement efficient gather using Candle ops
+        // This would use index_select or gather operations
 
         // TODO: Implement efficient gather using Candle ops
         // This would use index_select or gather operations

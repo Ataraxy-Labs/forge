@@ -3,9 +3,9 @@
 //! Handles downloading models from HuggingFace Hub and loading them into memory.
 
 use anyhow::{anyhow, bail, Result};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
-use candle_transformers::models::llama::{self as llama_model, Cache, Config, Llama, LlamaConfig, LlamaEosToks};
+use candle_transformers::models::llama::{Cache, Config, Llama, LlamaConfig, LlamaEosToks};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::path::PathBuf;
