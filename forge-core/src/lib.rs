@@ -15,3 +15,5 @@ pub mod engine;
 pub use request::{InferenceRequest, InferenceResponse, SamplingParams, FinishReason};
 pub use kv_cache::{PagedKVCache, CacheStats, PAGE_SIZE};
 pub use scheduler::{Scheduler, ScheduledBatch, SchedulerStats};
+pub use batcher::Sampler;
+pub use engine::{InferenceEngine, EngineConfig, EngineStats};

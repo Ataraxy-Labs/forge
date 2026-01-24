@@ -6,3 +6,17 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+forge-core = { path = "../forge-core" }
+tokio = { workspace = true }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[features]
+default = []
+cuda = ["forge-core/cuda"]
+metal = ["forge-core/metal"]
