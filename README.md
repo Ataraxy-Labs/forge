@@ -18,14 +18,26 @@ High-performance LLM inference engine in Rust, built on Candle. Inspired by Clou
 
 ### Prerequisites
 
-- Rust 1.70+
+- **Rust 1.83+** (required for `icu_normalizer_data` dependency)
 - HuggingFace account (for some models)
+
+#### Installing Rust 1.83+
+
+If you have an older Rust version, upgrade using rustup:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.83.0
+source "$HOME/.cargo/env"
+```
 
 ### Build
 
 ```bash
 # Clone candle (required dependency)
 git clone https://github.com/huggingface/candle.git
+
+# Fix candle for Rust 1.83 compatibility (replace unstable is_multiple_of)
+find candle -name "*.rs" -exec sed -i 's/\.is_multiple_of(\([^)]*\))/% \1 == 0/g' {} \;
 
 # Clone forge
 git clone https://github.com/Ataraxy-Labs/forge.git
@@ -40,6 +52,8 @@ cargo build --release --features metal
 # Build with CUDA
 cargo build --release --features cuda
 ```
+
+**Note:** The candle dependency uses the unstable `is_multiple_of()` feature which requires nightly Rust. The sed command above replaces it with the stable `% X == 0` equivalent for compatibility with Rust 1.83.
 
 ### Run CLI
 
