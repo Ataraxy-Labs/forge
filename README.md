@@ -57,14 +57,21 @@ cargo run --release --example generate -- \
 ### Run Server
 
 ```bash
-# Start with default model (SmolLM-135M)
+# Start with default model (SmolLM-135M) on CPU
 cargo run --release -p forge-server
 
+# Start with CUDA GPU acceleration (auto-detects GPU)
+cargo run --release --features cuda -p forge-server
+
 # Start with a specific model
-FORGE_MODEL="TinyLlama/TinyLlama-1.1B-Chat-v1.0" cargo run --release -p forge-server
+FORGE_MODEL="TinyLlama/TinyLlama-1.1B-Chat-v1.0" cargo run --release --features cuda -p forge-server
+
+# Force specific device (cpu, cuda, or metal)
+FORGE_DEVICE=cuda cargo run --release --features cuda -p forge-server
+FORGE_DEVICE=cpu cargo run --release -p forge-server
 
 # Change port
-FORGE_PORT=3000 cargo run --release -p forge-server
+FORGE_PORT=3000 cargo run --release --features cuda -p forge-server
 ```
 
 ### API Usage
@@ -120,16 +127,24 @@ forge/
 Environment variables:
 - `FORGE_MODEL` - HuggingFace model ID (default: SmolLM2-135M)
 - `FORGE_PORT` - Server port (default: 8080)
+- `FORGE_DEVICE` - Device to use: `cpu`, `cuda`, or `metal` (default: auto-detect)
 - `HF_HOME` - HuggingFace cache directory
 - `HF_TOKEN` - HuggingFace API token (for gated models)
 
 ## Performance
 
-On Apple M1 Pro (CPU):
-- SmolLM-135M: ~1.0 tok/s
-- TinyLlama-1.1B: ~0.3 tok/s
+**CPU Mode:**
+- SmolLM-135M: ~24 tok/s (x86_64 CPU)
+- TinyLlama-1.1B: ~8 tok/s
 
-With Metal acceleration expect 5-10x improvement.
+**GPU Mode (CUDA):**
+- SmolLM-135M: ~141 tok/s (5.9x faster than CPU)
+- TinyLlama-1.1B: ~40 tok/s (estimated)
+
+**GPU Mode (Metal on Apple Silicon):**
+- Expect 5-10x improvement over CPU
+
+**Note:** First GPU request includes CUDA graph compilation (~9s warmup), subsequent requests are fast.
 
 ## License
 

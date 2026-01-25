@@ -192,9 +192,97 @@ async fn main() -> anyhow::Result<()> {
     // Create engine config
     let engine_config = EngineConfig::with_model(model_config);
 
+    // Check for device preference from environment
+    let force_device = std::env::var("FORGE_DEVICE").ok();
+
+    // Determine device (GPU if available, otherwise CPU)
+    let device = match force_device.as_deref() {
+        Some("cpu") | Some("CPU") => {
+            info!("FORGE_DEVICE=cpu: Using CPU for inference");
+            candle_core::Device::Cpu
+        }
+        Some("cuda") | Some("CUDA") | Some("gpu") | Some("GPU") => {
+            if cfg!(feature = "cuda") {
+                match candle_core::Device::new_cuda(0) {
+                    Ok(cuda_device) => {
+                        info!("FORGE_DEVICE=cuda: Using CUDA GPU for inference");
+                        cuda_device
+                    }
+                    Err(e) => {
+                        info!("CUDA requested but not available ({}), falling back to CPU", e);
+                        candle_core::Device::Cpu
+                    }
+                }
+            } else {
+                info!("CUDA requested but not compiled in, using CPU");
+                candle_core::Device::Cpu
+            }
+        }
+        Some("metal") | Some("METAL") => {
+            if cfg!(feature = "metal") {
+                match candle_core::Device::new_metal(0) {
+                    Ok(metal_device) => {
+                        info!("FORGE_DEVICE=metal: Using Metal GPU for inference");
+                        metal_device
+                    }
+                    Err(e) => {
+                        info!("Metal requested but not available ({}), falling back to CPU", e);
+                        candle_core::Device::Cpu
+                    }
+                }
+            } else {
+                info!("Metal requested but not compiled in, using CPU");
+                candle_core::Device::Cpu
+            }
+        }
+        _ => {
+            // Auto-detect: try CUDA, then Metal, then CPU
+            if cfg!(feature = "cuda") {
+                match candle_core::Device::new_cuda(0) {
+                    Ok(cuda_device) => {
+                        info!("Auto-detected CUDA GPU for inference");
+                        cuda_device
+                    }
+                    Err(e) => {
+                        info!("CUDA not available ({}), trying Metal...", e);
+                        if cfg!(feature = "metal") {
+                            match candle_core::Device::new_metal(0) {
+                                Ok(metal_device) => {
+                                    info!("Auto-detected Metal GPU for inference");
+                                    metal_device
+                                }
+                                Err(e) => {
+                                    info!("Metal not available ({}), falling back to CPU", e);
+                                    candle_core::Device::Cpu
+                                }
+                            }
+                        } else {
+                            info!("Falling back to CPU");
+                            candle_core::Device::Cpu
+                        }
+                    }
+                }
+            } else if cfg!(feature = "metal") {
+                match candle_core::Device::new_metal(0) {
+                    Ok(metal_device) => {
+                        info!("Auto-detected Metal GPU for inference");
+                        metal_device
+                    }
+                    Err(e) => {
+                        info!("Metal not available ({}), falling back to CPU", e);
+                        candle_core::Device::Cpu
+                    }
+                }
+            } else {
+                info!("Using CPU for inference (no GPU features enabled)");
+                candle_core::Device::Cpu
+            }
+        }
+    };
+
     // Create inference engine
     info!("Initializing inference engine...");
-    let engine = InferenceEngine::new(engine_config, candle_core::Device::Cpu)?;
+    let engine = InferenceEngine::new(engine_config, device)?;
 
     let stats = engine.stats();
     info!("Engine initialized successfully!");
