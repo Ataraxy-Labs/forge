@@ -157,14 +157,98 @@ struct ModelRequest {
 
 async fn list_models(State(state): State<AppState>) -> Json<serde_json::Value> {
     let stats = state.engine.stats();
-    Json(serde_json::json!({
-        "object": "list",
-        "data": [{
+
+    // All supported models
+    let available_models = vec![
+        // Currently loaded (marked as ready)
+        serde_json::json!({
             "id": stats.model_id,
             "object": "model",
             "owned_by": "forge",
+            "ready": true,
             "permission": []
-        }]
+        }),
+        // LLaMA family
+        serde_json::json!({
+            "id": "HuggingFaceTB/SmolLM2-135M",
+            "object": "model",
+            "owned_by": "huggingface",
+            "ready": stats.model_id == "HuggingFaceTB/SmolLM2-135M",
+            "permission": []
+        }),
+        serde_json::json!({
+            "id": "HuggingFaceTB/SmolLM2-360M",
+            "object": "model",
+            "owned_by": "huggingface",
+            "ready": stats.model_id == "HuggingFaceTB/SmolLM2-360M",
+            "permission": []
+        }),
+        serde_json::json!({
+            "id": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            "object": "model",
+            "owned_by": "huggingface",
+            "ready": stats.model_id == "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            "permission": []
+        }),
+        // Qwen2 family
+        serde_json::json!({
+            "id": "Qwen/Qwen2-0.5B",
+            "object": "model",
+            "owned_by": "qwen",
+            "ready": stats.model_id == "Qwen/Qwen2-0.5B",
+            "permission": []
+        }),
+        serde_json::json!({
+            "id": "Qwen/Qwen2-1.5B",
+            "object": "model",
+            "owned_by": "qwen",
+            "ready": stats.model_id == "Qwen/Qwen2-1.5B",
+            "permission": []
+        }),
+        serde_json::json!({
+            "id": "Qwen/Qwen2-7B",
+            "object": "model",
+            "owned_by": "qwen",
+            "ready": stats.model_id == "Qwen/Qwen2-7B",
+            "permission": []
+        }),
+        // Qwen3 family
+        serde_json::json!({
+            "id": "Qwen/Qwen3-0.6B",
+            "object": "model",
+            "owned_by": "qwen",
+            "ready": stats.model_id == "Qwen/Qwen3-0.6B",
+            "permission": []
+        }),
+        serde_json::json!({
+            "id": "Qwen/Qwen3-1.7B",
+            "object": "model",
+            "owned_by": "qwen",
+            "ready": stats.model_id == "Qwen/Qwen3-1.7B",
+            "permission": []
+        }),
+        serde_json::json!({
+            "id": "Qwen/Qwen3-4B",
+            "object": "model",
+            "owned_by": "qwen",
+            "ready": stats.model_id == "Qwen/Qwen3-4B",
+            "permission": []
+        }),
+    ];
+
+    // Deduplicate (in case current model is already in the list)
+    let mut seen = std::collections::HashSet::new();
+    let unique_models: Vec<_> = available_models
+        .into_iter()
+        .filter(|m| {
+            let id = m["id"].as_str().unwrap_or("");
+            seen.insert(id.to_string())
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "object": "list",
+        "data": unique_models
     }))
 }
 
