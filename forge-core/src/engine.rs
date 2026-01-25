@@ -1,12 +1,11 @@
 //! Inference engine - orchestrates forward passes with real model execution
 //!
-//! This module implements the core inference loop using actual LLaMA models
-//! from candle-transformers.
+//! This module implements the core inference loop using multiple model architectures
+//! including LLaMA, Qwen2, and Qwen3 via the CausalLM trait.
 
 use anyhow::{anyhow, Result};
 use candle_core::{Device, Tensor};
-use candle_transformers::models::llama::LlamaEosToks;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use crate::model::{LoadedModel, ModelConfig, TokenOutputStream, create_logits_processor, load_model};
@@ -85,7 +84,7 @@ pub enum FinishReason {
 pub struct InferenceEngine {
     config: EngineConfig,
     device: Device,
-    model: Arc<LoadedModel>,
+    model: Arc<Mutex<LoadedModel>>,
 }
 
 impl InferenceEngine {
@@ -93,11 +92,12 @@ impl InferenceEngine {
     pub fn new(config: EngineConfig, device: Device) -> Result<Self> {
         info!("Initializing inference engine...");
         let model = load_model(&config.model_config, &device)?;
+        info!("Loaded model architecture: {:?}", model.arch);
 
         Ok(Self {
             config,
             device,
-            model: Arc::new(model),
+            model: Arc::new(Mutex::new(model)),
         })
     }
 
@@ -148,14 +148,19 @@ impl InferenceEngine {
         &self.device
     }
 
-    /// Get the loaded model
-    pub fn model(&self) -> &LoadedModel {
-        &self.model
+    /// Get access to the loaded model (locked)
+    pub fn with_model<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&LoadedModel) -> R,
+    {
+        let model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
+        Ok(f(&model))
     }
 
     /// Encode a prompt to tokens
     pub fn encode(&self, prompt: &str) -> Result<Vec<u32>> {
-        self.model.tokenizer
+        let model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
+        model.tokenizer
             .encode(prompt, true)
             .map_err(|e| anyhow!("Tokenization error: {}", e))
             .map(|enc| enc.get_ids().to_vec())
@@ -163,7 +168,8 @@ impl InferenceEngine {
 
     /// Decode tokens to text
     pub fn decode(&self, tokens: &[u32]) -> Result<String> {
-        self.model.tokenizer
+        let model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
+        model.tokenizer
             .decode(tokens, true)
             .map_err(|e| anyhow!("Decode error: {}", e))
     }
@@ -180,9 +186,6 @@ impl InferenceEngine {
         let mut tokens = prompt_tokens.to_vec();
         let mut generated_tokens = Vec::new();
 
-        // Create KV cache for this generation
-        let mut cache = self.model.new_cache()?;
-
         // Create logits processor
         let mut logits_processor = create_logits_processor(
             params.seed.unwrap_or(42),
@@ -194,9 +197,15 @@ impl InferenceEngine {
         let start_time = std::time::Instant::now();
         let mut index_pos = 0;
 
+        // Clear KV cache before starting generation
+        {
+            let mut model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
+            model.model.clear_kv_cache();
+        }
+
         for i in 0..params.max_tokens {
             // Determine context size (full for first token, 1 for subsequent)
-            let (context_size, context_index) = if cache.use_kv_cache && i > 0 {
+            let (context_size, context_index) = if i > 0 {
                 (1, index_pos)
             } else {
                 (tokens.len(), 0)
@@ -206,10 +215,18 @@ impl InferenceEngine {
             let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
 
-            // Forward pass
-            let logits = self.model.model.forward(&input, context_index, &mut cache)
-                .map_err(|e| anyhow!("Forward pass error: {}", e))?;
-            let logits = logits.squeeze(0).map_err(|e| anyhow!("Squeeze error: {}", e))?;
+            // Forward pass through the model
+            let logits = {
+                let mut model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
+                model.model.forward(&input, context_index)?
+            };
+            // Squeeze out batch dimension, handle both [batch, vocab] and [batch, 1, vocab] shapes
+            let logits = logits.squeeze(0).map_err(|e| anyhow!("Squeeze batch dim error: {}", e))?;
+            let logits = if logits.dims().len() > 1 {
+                logits.squeeze(0).map_err(|e| anyhow!("Squeeze seq dim error: {}", e))?
+            } else {
+                logits
+            };
 
             // Apply repeat penalty
             let logits = if self.config.repeat_penalty != 1.0 {
@@ -242,10 +259,9 @@ impl InferenceEngine {
             }
 
             // Check for EOS token
-            let is_eos = match &self.model.eos_token_id {
-                Some(LlamaEosToks::Single(eos)) if next_token == *eos => true,
-                Some(LlamaEosToks::Multiple(eos_ids)) if eos_ids.contains(&next_token) => true,
-                _ => false,
+            let is_eos = {
+                let model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
+                model.is_eos_token(next_token)
             };
 
             if is_eos {
@@ -286,9 +302,6 @@ impl InferenceEngine {
         let mut tokens = prompt_tokens.clone();
         let mut generated_tokens = Vec::new();
 
-        // Create KV cache for this generation
-        let mut cache = self.model.new_cache()?;
-
         // Create logits processor
         let mut logits_processor = create_logits_processor(
             params.seed.unwrap_or(42),
@@ -298,13 +311,23 @@ impl InferenceEngine {
         );
 
         // Create token output stream for incremental decoding
-        let mut token_stream = TokenOutputStream::new(self.model.tokenizer.clone());
+        let token_stream = {
+            let model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
+            TokenOutputStream::new(model.tokenizer.clone())
+        };
+        let mut token_stream = token_stream;
 
         let start_time = std::time::Instant::now();
         let mut index_pos = 0;
 
+        // Clear KV cache before starting generation
+        {
+            let mut model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
+            model.model.clear_kv_cache();
+        }
+
         for i in 0..params.max_tokens {
-            let (context_size, context_index) = if cache.use_kv_cache && i > 0 {
+            let (context_size, context_index) = if i > 0 {
                 (1, index_pos)
             } else {
                 (tokens.len(), 0)
@@ -313,9 +336,18 @@ impl InferenceEngine {
             let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
 
-            let logits = self.model.model.forward(&input, context_index, &mut cache)
-                .map_err(|e| anyhow!("Forward pass error: {}", e))?;
-            let logits = logits.squeeze(0).map_err(|e| anyhow!("Squeeze error: {}", e))?;
+            // Forward pass through the model
+            let logits = {
+                let mut model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
+                model.model.forward(&input, context_index)?
+            };
+            // Squeeze out batch dimension, handle both [batch, vocab] and [batch, 1, vocab] shapes
+            let logits = logits.squeeze(0).map_err(|e| anyhow!("Squeeze batch dim error: {}", e))?;
+            let logits = if logits.dims().len() > 1 {
+                logits.squeeze(0).map_err(|e| anyhow!("Squeeze seq dim error: {}", e))?
+            } else {
+                logits
+            };
 
             let logits = if self.config.repeat_penalty != 1.0 {
                 let start_at = tokens.len().saturating_sub(self.config.repeat_last_n);
@@ -350,10 +382,9 @@ impl InferenceEngine {
             }
 
             // Check for EOS token
-            let is_eos = match &self.model.eos_token_id {
-                Some(LlamaEosToks::Single(eos)) if next_token == *eos => true,
-                Some(LlamaEosToks::Multiple(eos_ids)) if eos_ids.contains(&next_token) => true,
-                _ => false,
+            let is_eos = {
+                let model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
+                model.is_eos_token(next_token)
             };
 
             if is_eos {
@@ -399,13 +430,14 @@ impl InferenceEngine {
 
     /// Get engine statistics
     pub fn stats(&self) -> EngineStats {
+        let model = self.model.lock().unwrap();
         EngineStats {
             device: format!("{:?}", self.device),
             model_id: self.config.model_config.model_id.clone(),
-            vocab_size: self.model.vocab_size(),
-            hidden_size: self.model.hidden_size(),
-            num_layers: self.model.num_layers(),
-            dtype: format!("{:?}", self.model.dtype),
+            vocab_size: model.vocab_size(),
+            hidden_size: model.hidden_size(),
+            num_layers: model.num_layers(),
+            dtype: format!("{:?}", model.dtype),
             max_seq_len: self.config.max_seq_len,
         }
     }

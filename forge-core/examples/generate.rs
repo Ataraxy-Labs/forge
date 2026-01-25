@@ -1,9 +1,14 @@
 //! Example: Direct text generation using Forge
 //!
-//! Run with: cargo run --example generate -- --prompt "Hello, my name is"
+//! Supports multiple model architectures: LLaMA, Qwen2, Qwen3, Mistral, SmolLM
+//!
+//! Run with:
+//!   cargo run --example generate -- --prompt "Hello, my name is"
+//!   cargo run --example generate -- --model Qwen/Qwen2-0.5B --prompt "Hello"
+//!   cargo run --example generate -- --model Qwen/Qwen3-0.6B --prompt "Hello"
 
 use anyhow::Result;
-use forge_core::{InferenceEngine, SamplingParams, EngineConfig, ModelConfig};
+use forge_core::{InferenceEngine, SamplingParams, EngineConfig, ModelConfig, ModelArch};
 use std::io::Write;
 
 fn main() -> Result<()> {
@@ -27,18 +32,30 @@ fn main() -> Result<()> {
         .map(|s| s.as_str())
         .unwrap_or("HuggingFaceTB/SmolLM2-135M");
 
+    // Detect architecture
+    let arch = ModelArch::from_model_id(model_id);
+
     println!("Forge - LLM Inference Engine");
     println!("Model: {}", model_id);
+    println!("Architecture: {:?}", arch);
     println!("Prompt: {}", prompt);
     println!("Max tokens: {}", max_tokens);
     println!();
 
-    // Create engine
+    // Create engine - use F16 for Qwen, F32 for SmolLM
     println!("Loading model...");
+    let dtype = if arch.is_qwen() {
+        candle_core::DType::F16
+    } else if model_id.to_lowercase().contains("smol") || model_id.to_lowercase().contains("tiny") {
+        candle_core::DType::F32
+    } else {
+        candle_core::DType::F16
+    };
+
     let model_config = ModelConfig {
         model_id: model_id.to_string(),
         revision: "main".to_string(),
-        dtype: candle_core::DType::F32,
+        dtype,
         use_flash_attn: false,
     };
     let engine_config = EngineConfig::with_model(model_config);

@@ -4,8 +4,10 @@ High-performance LLM inference engine in Rust, built on Candle. Inspired by Clou
 
 ## Features
 
+- **Multi-architecture support**: LLaMA, Qwen2, Qwen3, Mistral, SmolLM
 - Real model inference using HuggingFace transformers
 - Automatic model download from HuggingFace Hub
+- **Continuous batching** for high-throughput multi-request processing
 - KV caching for efficient token generation
 - Temperature, top-p, top-k sampling
 - Streaming text generation
@@ -47,11 +49,29 @@ cargo run --release --example generate -- \
   --prompt "The best programming language is" \
   --max-tokens 50
 
-# Use a different model
+# Use Qwen2 model
+cargo run --release --example generate -- \
+  --model "Qwen/Qwen2-0.5B" \
+  --prompt "Hello, I am" \
+  --max-tokens 30
+
+# Use Qwen3 model
+cargo run --release --example generate -- \
+  --model "Qwen/Qwen3-0.6B" \
+  --prompt "The meaning of life is" \
+  --max-tokens 30
+
+# Use TinyLlama
 cargo run --release --example generate -- \
   --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" \
   --prompt "Hello, my name is" \
   --max-tokens 30
+
+# Run batched inference (multiple concurrent requests)
+cargo run --release --example batch_generate
+
+# Run performance benchmark
+cargo run --release --example benchmark
 ```
 
 ### Run Server
@@ -96,30 +116,42 @@ curl http://localhost:8080/v1/models
 
 ## Supported Models
 
-Tested and working:
+### LLaMA Family
 - HuggingFaceTB/SmolLM2-135M (default)
 - HuggingFaceTB/SmolLM2-360M
 - HuggingFaceTB/SmolLM2-1.7B
 - TinyLlama/TinyLlama-1.1B-Chat-v1.0
 - meta-llama/Llama-3.2-1B (requires HF token)
 - meta-llama/Llama-3.2-3B (requires HF token)
+- Mistral models
 
-Any LLaMA-architecture model on HuggingFace should work.
+### Qwen Family
+- Qwen/Qwen2-0.5B
+- Qwen/Qwen2-1.5B
+- Qwen/Qwen2-7B
+- Qwen/Qwen3-0.6B
+- Qwen/Qwen3-1.7B
+- Qwen/Qwen3-4B
+
+Most LLaMA, Qwen2, and Qwen3 architecture models on HuggingFace should work.
 
 ## Project Structure
 
 ```
 forge/
-├── forge-core/       # Inference engine
+├── forge-core/           # Inference engine
 │   ├── src/
-│   │   ├── model.rs      # Model loading from HuggingFace
-│   │   ├── engine.rs     # Inference orchestration
-│   │   ├── kv_cache.rs   # Paged KV cache
-│   │   └── scheduler.rs  # Request scheduling
+│   │   ├── model.rs          # Model loading (LLaMA, Qwen2, Qwen3)
+│   │   ├── engine.rs         # Single-request inference
+│   │   ├── batch_engine.rs   # Batched inference with scheduling
+│   │   ├── kv_cache.rs       # Paged KV cache
+│   │   └── scheduler.rs      # Request scheduling
 │   └── examples/
-│       └── generate.rs   # CLI example
-├── forge-server/     # HTTP API server
-└── forge-kernels/    # GPU kernel optimizations
+│       ├── generate.rs       # Single-request CLI
+│       ├── batch_generate.rs # Batched inference demo
+│       └── benchmark.rs      # Performance benchmarks
+├── forge-server/         # HTTP API server
+└── forge-kernels/        # GPU kernel optimizations
 ```
 
 ## Configuration
@@ -133,18 +165,29 @@ Environment variables:
 
 ## Performance
 
-**CPU Mode:**
-- SmolLM-135M: ~24 tok/s (x86_64 CPU)
-- TinyLlama-1.1B: ~8 tok/s
+### Single Request (CPU Mode)
+| Model | Throughput | Notes |
+|-------|-----------|-------|
+| SmolLM-135M | ~47 tok/s | Apple M-series |
+| Qwen2-0.5B | ~30 tok/s | Apple M-series |
+| TinyLlama-1.1B | ~8 tok/s | x86_64 |
 
-**GPU Mode (CUDA):**
-- SmolLM-135M: ~141 tok/s (5.9x faster than CPU)
-- TinyLlama-1.1B: ~40 tok/s (estimated)
+### Batched Inference (CPU Mode)
+| Batch Size | Throughput | Per-Request Latency |
+|------------|------------|---------------------|
+| 8 requests | ~53 tok/s | ~950ms |
 
-**GPU Mode (Metal on Apple Silicon):**
-- Expect 5-10x improvement over CPU
+### GPU Mode (CUDA)
+| Model | Throughput | vs CPU |
+|-------|-----------|--------|
+| SmolLM-135M | ~141 tok/s | 5.9x faster |
+| TinyLlama-1.1B | ~40 tok/s | estimated |
+
+**GPU Mode (Metal on Apple Silicon):** Expect 5-10x improvement over CPU.
 
 **Note:** First GPU request includes CUDA graph compilation (~9s warmup), subsequent requests are fast.
+
+Run `cargo run --release --example benchmark` to measure performance on your hardware.
 
 ## License
 
