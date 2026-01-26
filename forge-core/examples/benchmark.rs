@@ -15,7 +15,14 @@ fn benchmark_single_request(prompt: &str, max_tokens: usize, num_runs: usize) ->
         repeat_last_n: 64,
     };
 
-    let engine = InferenceEngine::new(config, candle_core::Device::Cpu)?;
+    // Auto-detect device: CUDA if available, otherwise CPU
+    let device = if cfg!(feature = "cuda") && candle_core::Device::cuda_if_available(0).is_ok() {
+        candle_core::Device::cuda_if_available(0)?
+    } else {
+        candle_core::Device::Cpu
+    };
+
+    let engine = InferenceEngine::new(config, device)?;
 
     let params = SamplingParams {
         max_tokens,
@@ -57,7 +64,14 @@ fn benchmark_batched(prompts: &[&str], max_tokens: usize) -> Result<(f64, f64)> 
         ..Default::default()
     };
 
-    let engine = BatchInferenceEngine::new(config, candle_core::Device::Cpu)?;
+    // Auto-detect device: CUDA if available, otherwise CPU
+    let device = if cfg!(feature = "cuda") && candle_core::Device::cuda_if_available(0).is_ok() {
+        candle_core::Device::cuda_if_available(0)?
+    } else {
+        candle_core::Device::Cpu
+    };
+
+    let engine = BatchInferenceEngine::new(config, device)?;
 
     let params = SamplingParams {
         max_tokens,
@@ -104,8 +118,15 @@ fn main() -> Result<()> {
     let max_tokens = 50;
     let num_runs = 3;
 
+    // Detect device
+    let device_name = if cfg!(feature = "cuda") && candle_core::Device::cuda_if_available(0).is_ok() {
+        "CUDA GPU"
+    } else {
+        "CPU"
+    };
+
     // Single request benchmark
-    println!("1. Single Request Performance (SmolLM-135M, CPU)");
+    println!("1. Single Request Performance (SmolLM-135M, {})", device_name);
     println!("   Prompt: \"{}...\"", &prompt[..30.min(prompt.len())]);
     println!("   Max tokens: {}", max_tokens);
     println!("   Runs: {}", num_runs);
@@ -128,7 +149,7 @@ fn main() -> Result<()> {
         "Natural language processing enables",
     ];
 
-    println!("2. Batched Inference Performance (SmolLM-135M, CPU)");
+    println!("2. Batched Inference Performance (SmolLM-135M, {})", device_name);
     println!("   Requests: {}", batch_prompts.len());
     println!("   Max tokens per request: {}", max_tokens);
 

@@ -42,24 +42,31 @@ fn main() -> Result<()> {
     println!("Max tokens: {}", max_tokens);
     println!();
 
-    // Create engine - use F16 for Qwen, F32 for SmolLM
+    // Create engine - use F16 for GPU (required for Flash Attention), F32 for CPU
     println!("Loading model...");
-    let dtype = if arch.is_qwen() {
-        candle_core::DType::F16
-    } else if model_id.to_lowercase().contains("smol") || model_id.to_lowercase().contains("tiny") {
-        candle_core::DType::F32
+    let use_cuda = cfg!(feature = "cuda") && candle_core::Device::cuda_if_available(0).is_ok();
+    let dtype = if use_cuda {
+        candle_core::DType::F16  // F16 required for Flash Attention on GPU
     } else {
-        candle_core::DType::F16
+        candle_core::DType::F32  // F32 for CPU
     };
 
     let model_config = ModelConfig {
         model_id: model_id.to_string(),
         revision: "main".to_string(),
         dtype,
-        use_flash_attn: false,
+        use_flash_attn: true,
     };
     let engine_config = EngineConfig::with_model(model_config);
-    let engine = InferenceEngine::new(engine_config, candle_core::Device::Cpu)?;
+
+    // Auto-detect device: CUDA if available, otherwise CPU
+    let device = if cfg!(feature = "cuda") && candle_core::Device::cuda_if_available(0).is_ok() {
+        candle_core::Device::cuda_if_available(0)?
+    } else {
+        candle_core::Device::Cpu
+    };
+
+    let engine = InferenceEngine::new(engine_config, device)?;
 
     let stats = engine.stats();
     println!("Model loaded!");

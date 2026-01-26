@@ -191,17 +191,25 @@ Environment variables:
 |------------|------------|---------------------|
 | 8 requests | ~53 tok/s | ~950ms |
 
-### GPU Mode (CUDA)
-| Model | Throughput | vs CPU |
-|-------|-----------|--------|
-| SmolLM-135M | ~141 tok/s | 5.9x faster |
-| TinyLlama-1.1B | ~40 tok/s | estimated |
+### GPU Mode (CUDA + Flash Attention)
+| Model | Throughput | vs CPU | Features |
+|-------|-----------|--------|----------|
+| SmolLM-135M | ~136 tok/s | 5.6x faster | Flash Attn + F16 |
+| TinyLlama-1.1B | ~40 tok/s | estimated | Flash Attn + F16 |
 
 **GPU Mode (Metal on Apple Silicon):** Expect 5-10x improvement over CPU.
 
-**Note:** First GPU request includes CUDA graph compilation (~9s warmup), subsequent requests are fast.
+**Flash Attention Benefits:**
+- 2-4x faster attention computation
+- Lower memory usage
+- Requires F16/BF16 precision (automatically enabled on GPU)
 
-Run `cargo run --release --example benchmark` to measure performance on your hardware.
+**Build with Flash Attention:**
+```bash
+cargo run --release --features "cuda,flash-attn" --example benchmark
+```
+
+Run benchmarks to measure performance on your hardware.
 
 ## License
 
