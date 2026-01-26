@@ -8,18 +8,26 @@ use forge_core::{BatchInferenceEngine, BatchEngineConfig};
 use std::time::Instant;
 
 fn benchmark_single_request(prompt: &str, max_tokens: usize, num_runs: usize) -> Result<(f64, f64)> {
-    let config = EngineConfig {
-        model_config: ModelConfig::smollm_135m(),
-        max_seq_len: 2048,
-        repeat_penalty: 1.1,
-        repeat_last_n: 64,
-    };
-
     // Auto-detect device: CUDA if available, otherwise CPU
     let device = if cfg!(feature = "cuda") && candle_core::Device::cuda_if_available(0).is_ok() {
         candle_core::Device::cuda_if_available(0)?
     } else {
         candle_core::Device::Cpu
+    };
+    let is_gpu = matches!(device, candle_core::Device::Cuda(_));
+
+    let model_config = ModelConfig {
+        model_id: "HuggingFaceTB/SmolLM2-135M".to_string(),
+        revision: "main".to_string(),
+        dtype: if is_gpu { candle_core::DType::F16 } else { candle_core::DType::F32 },
+        use_flash_attn: is_gpu && cfg!(feature = "flash-attn"),
+    };
+
+    let config = EngineConfig {
+        model_config,
+        max_seq_len: 2048,
+        repeat_penalty: 1.1,
+        repeat_last_n: 64,
     };
 
     let engine = InferenceEngine::new(config, device)?;
@@ -56,19 +64,27 @@ fn benchmark_single_request(prompt: &str, max_tokens: usize, num_runs: usize) ->
 }
 
 fn benchmark_batched(prompts: &[&str], max_tokens: usize) -> Result<(f64, f64)> {
-    let config = BatchEngineConfig {
-        model_config: ModelConfig::smollm_135m(),
-        num_kv_pages: 128,
-        repeat_penalty: 1.1,
-        repeat_last_n: 64,
-        ..Default::default()
-    };
-
     // Auto-detect device: CUDA if available, otherwise CPU
     let device = if cfg!(feature = "cuda") && candle_core::Device::cuda_if_available(0).is_ok() {
         candle_core::Device::cuda_if_available(0)?
     } else {
         candle_core::Device::Cpu
+    };
+    let is_gpu = matches!(device, candle_core::Device::Cuda(_));
+
+    let model_config = ModelConfig {
+        model_id: "HuggingFaceTB/SmolLM2-135M".to_string(),
+        revision: "main".to_string(),
+        dtype: if is_gpu { candle_core::DType::F16 } else { candle_core::DType::F32 },
+        use_flash_attn: is_gpu && cfg!(feature = "flash-attn"),
+    };
+
+    let config = BatchEngineConfig {
+        model_config,
+        num_kv_pages: 128,
+        repeat_penalty: 1.1,
+        repeat_last_n: 64,
+        ..Default::default()
     };
 
     let engine = BatchInferenceEngine::new(config, device)?;
@@ -115,7 +131,7 @@ fn main() -> Result<()> {
     println!("============================\n");
 
     let prompt = "The future of artificial intelligence is";
-    let max_tokens = 50;
+    let max_tokens = 1000;
     let num_runs = 3;
 
     // Detect device

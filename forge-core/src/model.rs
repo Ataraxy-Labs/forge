@@ -125,7 +125,7 @@ impl ModelConfig {
         Self {
             model_id: "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string(),
             revision: "main".to_string(),
-            dtype: DType::F16,
+            dtype: DType::F32,
             use_flash_attn: true,
         }
     }
@@ -143,7 +143,7 @@ impl ModelConfig {
         Self {
             model_id: "HuggingFaceTB/SmolLM2-360M".to_string(),
             revision: "main".to_string(),
-            dtype: DType::F16,
+            dtype: DType::F32,
             use_flash_attn: true,
         }
     }

@@ -42,29 +42,24 @@ fn main() -> Result<()> {
     println!("Max tokens: {}", max_tokens);
     println!();
 
-    // Create engine - use F16 for GPU (required for Flash Attention), F32 for CPU
-    println!("Loading model...");
-    let use_cuda = cfg!(feature = "cuda") && candle_core::Device::cuda_if_available(0).is_ok();
-    let dtype = if use_cuda {
-        candle_core::DType::F16  // F16 required for Flash Attention on GPU
-    } else {
-        candle_core::DType::F32  // F32 for CPU
-    };
-
-    let model_config = ModelConfig {
-        model_id: model_id.to_string(),
-        revision: "main".to_string(),
-        dtype,
-        use_flash_attn: true,
-    };
-    let engine_config = EngineConfig::with_model(model_config);
-
     // Auto-detect device: CUDA if available, otherwise CPU
     let device = if cfg!(feature = "cuda") && candle_core::Device::cuda_if_available(0).is_ok() {
         candle_core::Device::cuda_if_available(0)?
     } else {
         candle_core::Device::Cpu
     };
+
+    // Create engine - F16 + Flash Attention on GPU for best performance
+    println!("Loading model...");
+    let is_gpu = matches!(device, candle_core::Device::Cuda(_));
+
+    let model_config = ModelConfig {
+        model_id: model_id.to_string(),
+        revision: "main".to_string(),
+        dtype: if is_gpu { candle_core::DType::F16 } else { candle_core::DType::F32 },
+        use_flash_attn: is_gpu && cfg!(feature = "flash-attn"),
+    };
+    let engine_config = EngineConfig::with_model(model_config);
 
     let engine = InferenceEngine::new(engine_config, device)?;
 

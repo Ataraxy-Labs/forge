@@ -182,32 +182,126 @@ impl BatchInferenceEngine {
             None => return Ok(vec![]),
         };
 
-        debug!("Processing batch with {} requests", batch.request_ids.len());
+        let batch_size = batch.request_ids.len();
+        debug!("Processing batch with {} requests", batch_size);
 
-        // For sequential processing, we process one request at a time
-        // Prefer the current cache owner to avoid cache invalidation
-        let cache_owner = *self.current_cache_owner.lock();
-
-        // Find the request to process - prefer current cache owner if in batch
-        let request_id = if let Some(owner) = cache_owner {
-            if batch.request_ids.contains(&owner) && self.active_requests.lock().contains_key(&owner) {
-                owner
-            } else {
-                // Cache owner finished or not in batch, pick first available
-                *batch.request_ids.first().unwrap()
-            }
-        } else {
-            *batch.request_ids.first().unwrap()
-        };
-
+        // TRUE BATCHING: Process all requests together
         let mut results = Vec::new();
         let mut generated_tokens = Vec::new();
 
-        // Process single request
-        let result = self.process_single_request(request_id)?;
-        if let Some((token, is_finished)) = result {
-            results.push((request_id, token, is_finished));
-            generated_tokens.push((request_id, token));
+        // Collect input tokens and metadata for all requests in batch
+        let mut batch_inputs = Vec::new();
+        let mut request_order = Vec::new();
+
+        {
+            let mut active = self.active_requests.lock();
+            for &request_id in &batch.request_ids {
+                if let Some(active_req) = active.get_mut(&request_id) {
+                    let state = &mut active_req.state;
+
+                    // Determine input tokens for this request
+                    let input_tokens = if state.is_prefill {
+                        state.request.tokens.clone()
+                    } else {
+                        // Decode phase - use last generated token
+                        vec![state.generated_tokens.last()
+                            .or(state.request.tokens.last())
+                            .copied()
+                            .unwrap_or(0)]
+                    };
+
+                    batch_inputs.push(input_tokens);
+                    request_order.push(request_id);
+                }
+            }
+        }
+
+        if batch_inputs.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Find max sequence length in this batch
+        let max_len = batch_inputs.iter().map(|t| t.len()).max().unwrap_or(1);
+
+        // Pad sequences to same length and create batch tensor
+        let mut padded_batch = Vec::new();
+        for tokens in &batch_inputs {
+            let mut padded = tokens.clone();
+            while padded.len() < max_len {
+                padded.push(0); // Pad with 0
+            }
+            padded_batch.extend(padded);
+        }
+
+        // Create batched input tensor [batch_size, seq_len]
+        let input = Tensor::new(&padded_batch[..], &self.device)?
+            .reshape(&[batch_size, max_len])?;
+
+        // Forward pass with batched input
+        let logits = {
+            let mut model = self.model.lock();
+            // Clear cache for batched processing (simple approach)
+            model.clear_kv_cache();
+            model.forward(&input, 0)?
+        };
+
+        // Process logits for each request in the batch
+        let mut active = self.active_requests.lock();
+        for (batch_idx, &request_id) in request_order.iter().enumerate() {
+            if let Some(active_req) = active.get_mut(&request_id) {
+                // Extract logits for this batch element
+                let req_logits = logits.get(batch_idx)?;
+
+                // Get last token logits
+                let last_logits = if req_logits.dims().len() > 1 {
+                    req_logits.get(req_logits.dims()[0] - 1)?
+                } else {
+                    req_logits.clone()
+                };
+
+                // Apply repeat penalty
+                let penalized_logits = if self.config.repeat_penalty != 1.0 {
+                    let all_tokens: Vec<u32> = active_req.state.request.tokens.iter()
+                        .chain(active_req.state.generated_tokens.iter())
+                        .copied()
+                        .collect();
+                    let start_at = all_tokens.len().saturating_sub(self.config.repeat_last_n);
+                    candle_transformers::utils::apply_repeat_penalty(
+                        &last_logits,
+                        self.config.repeat_penalty,
+                        &all_tokens[start_at..],
+                    )?
+                } else {
+                    last_logits
+                };
+
+                // Sample next token
+                let next_token = active_req.logits_processor.sample(&penalized_logits)?;
+
+                // Check if finished
+                let is_eos = if let Some(eos) = &self.eos_token_id {
+                    eos.contains(next_token)
+                } else {
+                    false
+                };
+
+                let max_tokens_reached = active_req.state.generated_tokens.len()
+                    >= active_req.state.request.params.max_tokens;
+
+                let is_finished = is_eos || max_tokens_reached;
+
+                // Update state
+                active_req.state.generated_tokens.push(next_token);
+                active_req.state.is_prefill = false;
+
+                results.push((request_id, next_token, is_finished));
+                generated_tokens.push((request_id, next_token));
+
+                if is_finished {
+                    let mut stats = self.stats.lock();
+                    stats.completed_requests += 1;
+                }
+            }
         }
 
         // Update scheduler with generated tokens
@@ -217,7 +311,7 @@ impl BatchInferenceEngine {
         {
             let mut stats = self.stats.lock();
             stats.total_tokens_generated += results.len() as u64;
-            stats.current_batch_size = 1; // Sequential processing for now
+            stats.current_batch_size = batch_size;
         }
 
         Ok(results)

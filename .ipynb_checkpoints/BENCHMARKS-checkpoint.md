@@ -15,7 +15,6 @@ Comprehensive performance comparison between Forge CPU, Forge GPU, and vLLM.
 |--------|---------|------------|-----------|-----------------|
 | **Forge CPU** | 1827ms | 24.13 tok/s | 25.5% avg, 29.3% peak | ~2s |
 | **Forge GPU (Flash Attn + F16)** | 368ms | 135.85 tok/s | 18.2% avg, 18.7% peak | ~2s + warmup |
-| **Forge GPU (Batched, batch=8)** | N/A | **360 tok/s** | 40-50% GPU util | ~2s + warmup |
 | **vLLM** | 68ms | 665.21 tok/s | ~0% (GPU) | 17.32s |
 
 ## Detailed Results
@@ -57,34 +56,6 @@ Comprehensive performance comparison between Forge CPU, Forge GPU, and vLLM.
 - ✓ Excellent middle ground between CPU and vLLM
 - ✓ Flash Attention provides significant speedup over standard attention
 
-### Forge GPU Mode (Batched Inference - NEW!)
-
-**Batch Size Scaling:**
-
-| Batch Size | Tokens/Request | Total Tokens | Time | Throughput | Speedup vs Sequential |
-|------------|----------------|--------------|------|------------|----------------------|
-| 1 (baseline) | 100 | 400 | 3.45s | 112 tok/s | 1.0x |
-| 2 | 100 | 200 | 1.11s | 180 tok/s | 1.6x |
-| 4 | 100 | 400 | 1.39s | 288 tok/s | **2.6x** |
-| 8 | 100 | 800 | 2.48s | 322 tok/s | **2.9x** |
-| 8 | 500 | 4000 | 11.10s | **360 tok/s** | **3.2x** |
-| 4 | 1000 | 4000 | 13.30s | 301 tok/s | **2.7x** |
-
-**Optimizations Enabled:**
-- ✓ TRUE batching - process multiple requests in parallel
-- ✓ Flash Attention v2 for efficient attention
-- ✓ F16 precision on GPU
-- ✓ Batched tensor operations
-- ✓ Optimized padding and masking
-
-**Analysis:**
-- ✓ **3.2x speedup** with batch=8 over sequential processing
-- ✓ **360 tok/s peak** with batch=8, 500 tokens per request
-- ✓ Closes gap with vLLM from 4.9x to **1.85x**
-- ✓ GPU utilization: 40-50% (efficient parallel processing)
-- ✓ Scales well with batch size: 2x → 288 tok/s, 4x → 288 tok/s, 8x → 360 tok/s
-- ✓ Better GPU memory bandwidth utilization with batching
-
 ### vLLM
 
 | Run | Latency | Tokens | Throughput | CPU |
@@ -102,12 +73,9 @@ Comprehensive performance comparison between Forge CPU, Forge GPU, and vLLM.
 
 ## Performance Improvements
 
-- **Forge GPU vs Forge CPU**: 5.6x faster (24 tok/s → 136 tok/s)
-- **Forge GPU Batched vs Forge GPU Sequential**: 2.7-3.2x faster (136 tok/s → 360 tok/s)
-- **Forge GPU Batched vs Forge CPU**: **15x faster** (24 tok/s → 360 tok/s)
-- **vLLM vs Forge GPU Batched**: 1.85x faster (360 tok/s → 665 tok/s)
-- **vLLM vs Forge GPU Sequential**: 4.9x faster (136 tok/s → 665 tok/s)
-- **vLLM vs Forge CPU**: 27.7x faster (24 tok/s → 665 tok/s)
+- **Forge GPU vs Forge CPU**: 5.6x faster (1827ms → 368ms)
+- **vLLM vs Forge GPU**: 4.9x faster (368ms → 68ms)
+- **vLLM vs Forge CPU**: 26.9x faster (1827ms → 68ms)
 
 ## CPU Overload Analysis
 
@@ -140,17 +108,15 @@ vLLM:       █ 68ms
 ## Throughput Comparison
 
 ```
-Forge CPU:              ██ 24 tok/s
-Forge GPU (sequential): ███████ 136 tok/s
-Forge GPU (batched):    ██████████████ 360 tok/s
-vLLM:                   ████████████████████ 665 tok/s
+Forge CPU:  ██ 24 tok/s
+Forge GPU:  ███████ 136 tok/s
+vLLM:       ████████████████████ 665 tok/s
 ```
 
 **Rankings (higher is better):**
 1. vLLM: 665 tok/s (fastest)
-2. **Forge GPU (batched)**: 360 tok/s (1.85x slower than vLLM, 15x faster than CPU) ⭐ NEW!
-3. Forge GPU (sequential): 136 tok/s (4.9x slower than vLLM, 5.6x faster than CPU)
-4. Forge CPU: 24 tok/s (27.7x slower than vLLM)
+2. Forge GPU: 136 tok/s (4.9x slower than vLLM, 5.6x faster than CPU)
+3. Forge CPU: 24 tok/s (27.7x slower than vLLM)
 
 ## Startup & Warmup Times
 
@@ -225,69 +191,18 @@ python3 -m vllm.entrypoints.openai.api_server \
 
 ## Conclusion
 
-Forge now offers excellent GPU acceleration with **15x performance improvement** over CPU mode (360 tok/s batched) while maintaining:
+Forge now offers excellent GPU acceleration with **5.6x performance improvement** over CPU mode (136 tok/s) while maintaining:
 - Fast startup times (2s vs 17s for vLLM)
+- Low CPU usage (18% average)
 - Simple deployment
 - Rust's memory safety and performance benefits
-- TRUE batching support for parallel request processing
 
 **Key Optimizations:**
-- ✅ **TRUE Batching** - Process multiple requests in parallel (2.7-3.2x speedup)
-- ✅ **Flash Attention v2** - 2-4x faster attention computation
-- ✅ **F16 precision** - Native GPU computation without dtype conversions
-- ✅ **Auto CUDA detection** - Seamless GPU acceleration
-- ✅ **Batched tensor operations** - Efficient parallel processing
+- Flash Attention for 2-4x faster attention computation
+- F16 precision for GPU inference
+- Auto CUDA device detection
+- Optimized KV cache management
 
-**Performance Milestones:**
-- Sequential: 136 tok/s (5.6x faster than CPU)
-- Batched (4 requests): 288 tok/s (12x faster than CPU)
-- Batched (8 requests): **360 tok/s** (15x faster than CPU) 🎉
+All three modes (Forge CPU, Forge GPU, vLLM) demonstrate **no CPU overload issues**, making them all viable options depending on your specific requirements for throughput, startup time, and hardware availability.
 
-All modes demonstrate **no CPU overload issues**, making them all viable options depending on your specific requirements.
-
-**Performance Gap with vLLM:** The gap has been reduced from **4.9x to 1.85x** (665 vs 360 tok/s) with batching. Remaining optimizations to close the gap further:
-
-### How to Close the Gap with vLLM
-
-**Current Status:**
-- Forge GPU Batched: 360 tok/s
-- vLLM: 665 tok/s
-- Gap: 1.85x
-
-**Optimizations to Implement:**
-
-1. **Continuous Batching** (Expected: +20-30% improvement)
-   - Currently: All requests in batch start/end together
-   - vLLM: Dynamically add/remove requests mid-batch
-   - Impact: Better GPU utilization, less idle time
-
-2. **PagedAttention for KV Cache** (Expected: +15-25% improvement)
-   - Currently: Fixed KV cache allocation
-   - vLLM: Virtual memory paging for KV cache
-   - Impact: Better memory efficiency, larger batch sizes possible
-
-3. **CUDA Graphs** (Expected: +10-20% improvement)
-   - Currently: Kernel launches have overhead
-   - vLLM: Pre-compiled execution graphs
-   - Impact: Reduced kernel launch latency
-
-4. **Kernel Fusion** (Expected: +10-15% improvement)
-   - Currently: Separate operations for attention, normalization, etc.
-   - vLLM: Fused custom CUDA kernels
-   - Impact: Fewer memory transfers, better cache utilization
-
-5. **Quantization Support** (Expected: +30-50% improvement)
-   - Currently: F16 precision
-   - vLLM: INT8/INT4 quantization support
-   - Impact: 2x memory bandwidth, larger batch sizes
-
-**Estimated Performance with All Optimizations:**
-- Current: 360 tok/s
-- With optimizations: 500-700 tok/s (matching or exceeding vLLM)
-
-**Priority Order:**
-1. Continuous batching (biggest impact, moderate complexity)
-2. PagedAttention (enables larger batches, high complexity)
-3. CUDA graphs (good ROI, moderate complexity)
-4. Kernel fusion (significant work, high complexity)
-5. Quantization (good for memory-limited scenarios)
+**Performance Gap with vLLM:** vLLM remains 4.9x faster (665 vs 136 tok/s) due to additional optimizations like continuous batching, CUDA graph optimization, and PagedAttention. Future improvements to Forge could close this gap further.
