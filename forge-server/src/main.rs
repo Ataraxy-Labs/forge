@@ -265,12 +265,12 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Selected model: {}", model_id);
 
-    // Create model config
+    // Create model config with optimal settings
     let model_config = ModelConfig {
         model_id: model_id.clone(),
         revision: "main".to_string(),
-        dtype: candle_core::DType::F32,
-        use_flash_attn: false,
+        dtype: candle_core::DType::F16,  // Use F16 for GPU efficiency
+        use_flash_attn: true,  // Enable Flash Attention
     };
 
     // Create engine config

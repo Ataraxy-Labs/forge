@@ -181,10 +181,13 @@ impl InferenceEngine {
     }
 
     /// Generate text from tokens
+    ///
+    /// Optimized for throughput: holds model lock for entire generation,
+    /// minimizes tensor allocations, uses prefill+decode separation.
     pub fn generate_from_tokens(&self, prompt_tokens: &[u32], params: &SamplingParams) -> Result<GenerationResult> {
         let prompt_len = prompt_tokens.len();
         let mut tokens = prompt_tokens.to_vec();
-        let mut generated_tokens = Vec::new();
+        let mut generated_tokens = Vec::with_capacity(params.max_tokens);
 
         // Create logits processor
         let mut logits_processor = create_logits_processor(
@@ -195,104 +198,114 @@ impl InferenceEngine {
         );
 
         let start_time = std::time::Instant::now();
-        let mut index_pos = 0;
 
-        // Clear KV cache before starting generation
-        {
-            let mut model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
-            model.model.clear_kv_cache();
+        // Hold lock for entire generation
+        let mut model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
+
+        // Cache EOS token upfront
+        let eos_token_id = model.eos_token_id.clone();
+
+        // Clear KV cache
+        model.model.clear_kv_cache();
+
+        // ===== PREFILL PHASE =====
+        // Process all prompt tokens at once
+        let input = Tensor::new(&tokens[..], &self.device)?.unsqueeze(0)?;
+        let logits = model.model.forward(&input, 0)?;
+
+        let logits_2d = logits.squeeze(0)?;
+        let mut last_logits = if logits_2d.dims().len() == 2 {
+            logits_2d.get(logits_2d.dim(0)? - 1)?
+        } else {
+            logits_2d
+        };
+
+        // Apply repeat penalty for first token
+        if self.config.repeat_penalty != 1.0 {
+            let start_at = tokens.len().saturating_sub(self.config.repeat_last_n);
+            last_logits = candle_transformers::utils::apply_repeat_penalty(
+                &last_logits,
+                self.config.repeat_penalty,
+                &tokens[start_at..],
+            )?;
         }
 
-        for i in 0..params.max_tokens {
-            // Determine context size (full for first token, 1 for subsequent)
-            let (context_size, context_index) = if i > 0 {
-                (1, index_pos)
-            } else {
-                (tokens.len(), 0)
-            };
+        let mut index_pos = tokens.len();
 
-            // Get the context tokens
-            let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
-            let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
+        // Sample first token after prompt
+        let first_token = logits_processor.sample(&last_logits)?;
 
-            // Forward pass through the model
-            let logits = {
-                let mut model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
-                model.model.forward(&input, context_index)?
-            };
-            // Squeeze out batch dimension, handle both [batch, vocab] and [batch, 1, vocab] shapes
-            let logits = logits.squeeze(0).map_err(|e| anyhow!("Squeeze batch dim error: {}", e))?;
-            let logits = if logits.dims().len() > 1 {
-                logits.squeeze(0).map_err(|e| anyhow!("Squeeze seq dim error: {}", e))?
-            } else {
-                logits
-            };
+        // Check termination
+        if params.stop_tokens.contains(&first_token) ||
+           eos_token_id.as_ref().map_or(false, |eos| eos.contains(first_token)) {
+            drop(model);
+            return Ok(GenerationResult {
+                tokens: generated_tokens,
+                text: String::new(),
+                prompt_tokens: prompt_len,
+                generated_tokens: 0,
+                tokens_per_second: 0.0,
+                finish_reason: FinishReason::Stop,
+            });
+        }
+
+        generated_tokens.push(first_token);
+        tokens.push(first_token);
+
+        // ===== DECODE PHASE =====
+        // Generate tokens one at a time using KV cache
+        while generated_tokens.len() < params.max_tokens {
+            // Single token input
+            let input = Tensor::new(&[tokens[tokens.len() - 1]], &self.device)?.unsqueeze(0)?;
+            let logits = model.model.forward(&input, index_pos)?;
+
+            let mut logits = logits.squeeze(0)?;
+            if logits.dims().len() == 2 {
+                logits = logits.squeeze(0)?;
+            }
 
             // Apply repeat penalty
-            let logits = if self.config.repeat_penalty != 1.0 {
+            if self.config.repeat_penalty != 1.0 {
                 let start_at = tokens.len().saturating_sub(self.config.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
+                logits = candle_transformers::utils::apply_repeat_penalty(
                     &logits,
                     self.config.repeat_penalty,
                     &tokens[start_at..],
-                ).map_err(|e| anyhow!("Repeat penalty error: {}", e))?
-            } else {
-                logits
-            };
-
-            index_pos += ctxt.len();
-
-            // Sample next token
-            let next_token = logits_processor.sample(&logits)
-                .map_err(|e| anyhow!("Sampling error: {}", e))?;
-
-            // Check for stop tokens
-            if params.stop_tokens.contains(&next_token) {
-                return Ok(GenerationResult {
-                    tokens: generated_tokens.clone(),
-                    text: self.decode(&generated_tokens)?,
-                    prompt_tokens: prompt_len,
-                    generated_tokens: generated_tokens.len(),
-                    tokens_per_second: generated_tokens.len() as f64 / start_time.elapsed().as_secs_f64(),
-                    finish_reason: FinishReason::Stop,
-                });
+                )?;
             }
 
-            // Check for EOS token
-            let is_eos = {
-                let model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
-                model.is_eos_token(next_token)
-            };
+            index_pos += 1;
+            let next_token = logits_processor.sample(&logits)?;
 
-            if is_eos {
-                return Ok(GenerationResult {
-                    tokens: generated_tokens.clone(),
-                    text: self.decode(&generated_tokens)?,
-                    prompt_tokens: prompt_len,
-                    generated_tokens: generated_tokens.len(),
-                    tokens_per_second: generated_tokens.len() as f64 / start_time.elapsed().as_secs_f64(),
-                    finish_reason: FinishReason::Stop,
-                });
+            // Check termination
+            if params.stop_tokens.contains(&next_token) ||
+               eos_token_id.as_ref().map_or(false, |eos| eos.contains(next_token)) {
+                break;
             }
 
             generated_tokens.push(next_token);
             tokens.push(next_token);
         }
 
-        let elapsed = start_time.elapsed();
-        let tokens_per_second = generated_tokens.len() as f64 / elapsed.as_secs_f64();
+        drop(model);
+        let gen_count = generated_tokens.len();
+        let text = self.decode(&generated_tokens)?;
+        let tokens_per_second = gen_count as f64 / start_time.elapsed().as_secs_f64();
 
         Ok(GenerationResult {
-            tokens: generated_tokens.clone(),
-            text: self.decode(&generated_tokens)?,
+            tokens: generated_tokens,
+            text,
             prompt_tokens: prompt_len,
-            generated_tokens: generated_tokens.len(),
+            generated_tokens: gen_count,
             tokens_per_second,
             finish_reason: FinishReason::Length,
         })
     }
 
     /// Generate with streaming output
+    ///
+    /// Optimized for throughput: holds model lock during generation,
+    /// releases only for streaming callbacks when needed.
     pub fn generate_streaming<F>(&self, prompt: &str, params: &SamplingParams, mut callback: F) -> Result<GenerationResult>
     where
         F: FnMut(&str),
@@ -300,7 +313,7 @@ impl InferenceEngine {
         let prompt_tokens = self.encode(prompt)?;
         let prompt_len = prompt_tokens.len();
         let mut tokens = prompt_tokens.clone();
-        let mut generated_tokens = Vec::new();
+        let mut generated_tokens = Vec::with_capacity(params.max_tokens);
 
         // Create logits processor
         let mut logits_processor = create_logits_processor(
@@ -310,93 +323,68 @@ impl InferenceEngine {
             params.top_k,
         );
 
-        // Create token output stream for incremental decoding
-        let token_stream = {
-            let model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
-            TokenOutputStream::new(model.tokenizer.clone())
-        };
-        let mut token_stream = token_stream;
-
         let start_time = std::time::Instant::now();
+
+        // OPTIMIZATION: Hold lock for entire generation
+        let mut model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
+
+        // Create token output stream and cache EOS upfront
+        let mut token_stream = TokenOutputStream::new(model.tokenizer.clone());
+        let eos_token_id = model.eos_token_id.clone();
+
+        // Clear KV cache
+        model.model.clear_kv_cache();
+
         let mut index_pos = 0;
 
-        // Clear KV cache before starting generation
-        {
-            let mut model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
-            model.model.clear_kv_cache();
-        }
-
         for i in 0..params.max_tokens {
-            let (context_size, context_index) = if i > 0 {
-                (1, index_pos)
+            let (ctxt, context_index) = if i == 0 {
+                (&tokens[..], 0)
             } else {
-                (tokens.len(), 0)
+                (&tokens[tokens.len() - 1..], index_pos)
             };
 
-            let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
+            let logits = model.model.forward(&input, context_index)?;
 
-            // Forward pass through the model
-            let logits = {
-                let mut model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
-                model.model.forward(&input, context_index)?
-            };
-            // Squeeze out batch dimension, handle both [batch, vocab] and [batch, 1, vocab] shapes
-            let logits = logits.squeeze(0).map_err(|e| anyhow!("Squeeze batch dim error: {}", e))?;
-            let logits = if logits.dims().len() > 1 {
-                logits.squeeze(0).map_err(|e| anyhow!("Squeeze seq dim error: {}", e))?
-            } else {
-                logits
-            };
+            // Extract final token logits
+            let mut logits = logits.squeeze(0)?;
+            if logits.dims().len() == 2 {
+                logits = logits.squeeze(0)?;
+            }
 
-            let logits = if self.config.repeat_penalty != 1.0 {
+            // Apply repeat penalty
+            if self.config.repeat_penalty != 1.0 {
                 let start_at = tokens.len().saturating_sub(self.config.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
+                logits = candle_transformers::utils::apply_repeat_penalty(
                     &logits,
                     self.config.repeat_penalty,
                     &tokens[start_at..],
-                ).map_err(|e| anyhow!("Repeat penalty error: {}", e))?
-            } else {
-                logits
-            };
+                )?;
+            }
 
             index_pos += ctxt.len();
 
-            let next_token = logits_processor.sample(&logits)
-                .map_err(|e| anyhow!("Sampling error: {}", e))?;
+            let next_token = logits_processor.sample(&logits)?;
 
-            // Check for stop tokens
-            if params.stop_tokens.contains(&next_token) {
-                // Flush remaining tokens
+            // Check termination
+            let is_stop = params.stop_tokens.contains(&next_token);
+            let is_eos = eos_token_id.as_ref().map_or(false, |eos| eos.contains(next_token));
+
+            if is_stop || is_eos {
+                drop(model); // Release lock before callback
                 if let Ok(Some(text)) = token_stream.decode_rest() {
                     callback(&text);
                 }
+                let gen_count = generated_tokens.len();
+                let text = token_stream.decode_all()?;
+                let tok_per_sec = gen_count as f64 / start_time.elapsed().as_secs_f64();
                 return Ok(GenerationResult {
-                    tokens: generated_tokens.clone(),
-                    text: token_stream.decode_all()?,
+                    tokens: generated_tokens,
+                    text,
                     prompt_tokens: prompt_len,
-                    generated_tokens: generated_tokens.len(),
-                    tokens_per_second: generated_tokens.len() as f64 / start_time.elapsed().as_secs_f64(),
-                    finish_reason: FinishReason::Stop,
-                });
-            }
-
-            // Check for EOS token
-            let is_eos = {
-                let model = self.model.lock().map_err(|e| anyhow!("Failed to lock model: {}", e))?;
-                model.is_eos_token(next_token)
-            };
-
-            if is_eos {
-                if let Ok(Some(text)) = token_stream.decode_rest() {
-                    callback(&text);
-                }
-                return Ok(GenerationResult {
-                    tokens: generated_tokens.clone(),
-                    text: token_stream.decode_all()?,
-                    prompt_tokens: prompt_len,
-                    generated_tokens: generated_tokens.len(),
-                    tokens_per_second: generated_tokens.len() as f64 / start_time.elapsed().as_secs_f64(),
+                    generated_tokens: gen_count,
+                    tokens_per_second: tok_per_sec,
                     finish_reason: FinishReason::Stop,
                 });
             }
@@ -404,19 +392,18 @@ impl InferenceEngine {
             generated_tokens.push(next_token);
             tokens.push(next_token);
 
-            // Stream output
+            // Stream output (callback doesn't need model lock)
             if let Ok(Some(text)) = token_stream.next_token(next_token) {
                 callback(&text);
             }
         }
 
-        // Flush remaining tokens
+        drop(model); // Release lock before final callback
         if let Ok(Some(text)) = token_stream.decode_rest() {
             callback(&text);
         }
 
-        let elapsed = start_time.elapsed();
-        let tokens_per_second = generated_tokens.len() as f64 / elapsed.as_secs_f64();
+        let tokens_per_second = generated_tokens.len() as f64 / start_time.elapsed().as_secs_f64();
 
         Ok(GenerationResult {
             tokens: generated_tokens,

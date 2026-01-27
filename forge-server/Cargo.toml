@@ -21,3 +21,4 @@ anyhow = { workspace = true }
 default = []
 cuda = ["forge-core/cuda"]
 metal = ["forge-core/metal"]
+flash-attn = ["forge-core/flash-attn"]

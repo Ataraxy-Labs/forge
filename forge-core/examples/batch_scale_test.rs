@@ -51,12 +51,9 @@ fn main() -> Result<()> {
 
     // Test different batch sizes with different token lengths
     let test_configs = vec![
-        ("Batch=2, Tokens=100", 2, 100),
-        ("Batch=4, Tokens=100", 4, 100),
-        ("Batch=8, Tokens=100", 8, 100),
-        ("Batch=4, Tokens=500", 4, 500),
         ("Batch=8, Tokens=500", 8, 500),
-        ("Batch=4, Tokens=1000", 4, 1000),
+        ("Batch=16, Tokens=500", 16, 500),
+        ("Batch=32, Tokens=500", 32, 500),
     ];
 
     for (name, batch_size, max_tokens) in test_configs {

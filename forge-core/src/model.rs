@@ -235,7 +235,7 @@ pub trait CausalLM: Send {
 /// Wrapper for Llama models that implements CausalLM
 pub struct LlamaWrapper {
     model: Llama,
-    cache: Mutex<Cache>,
+    cache: Cache,  // No Mutex - already protected by outer lock in engine
     config: LlamaConfig,
     dtype: DType,
     device: Device,
@@ -246,7 +246,7 @@ impl LlamaWrapper {
         let cache = Cache::new(true, dtype, &config, device).map_err(|e| anyhow!(e))?;
         Ok(Self {
             model,
-            cache: Mutex::new(cache),
+            cache,  // Direct ownership, no mutex
             config,
             dtype,
             device: device.clone(),
@@ -256,17 +256,15 @@ impl LlamaWrapper {
 
 impl CausalLM for LlamaWrapper {
     fn forward(&mut self, input_ids: &Tensor, seq_offset: usize) -> Result<Tensor> {
-        let mut cache = self.cache.lock().unwrap();
-        self.model.forward(input_ids, seq_offset, &mut cache)
+        // No mutex lock needed - caller already has exclusive access via &mut self
+        self.model.forward(input_ids, seq_offset, &mut self.cache)
             .map_err(|e| anyhow!("Llama forward error: {}", e))
     }
 
     fn clear_kv_cache(&mut self) {
-        // Create a new cache to reset KV state
+        // Create a new cache to reset KV state - no mutex needed
         if let Ok(new_cache) = Cache::new(true, self.dtype, &self.config, &self.device) {
-            if let Ok(mut cache) = self.cache.lock() {
-                *cache = new_cache;
-            }
+            self.cache = new_cache;
         }
     }
 

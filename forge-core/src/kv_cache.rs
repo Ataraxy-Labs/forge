@@ -24,10 +24,11 @@ pub struct PagedKVCache {
     free_pages: Arc<Mutex<Vec<usize>>>,
     /// Total number of pages allocated
     total_pages: usize,
-    /// Actual K/V tensors per layer
-    /// Shape: [num_layers, total_pages, PAGE_SIZE, num_heads, head_dim]
-    _k_cache: Vec<Tensor>,
-    _v_cache: Vec<Tensor>,
+    /// Actual K/V tensors per layer, stored as separate pages
+    /// Shape per page: [PAGE_SIZE, num_heads, head_dim]
+    /// Outer vec: layers, Inner vec: pages
+    _k_cache: Vec<Vec<Tensor>>,
+    _v_cache: Vec<Vec<Tensor>>,
 }
 
 impl PagedKVCache {
@@ -43,20 +44,26 @@ impl PagedKVCache {
         let mut k_cache = Vec::with_capacity(num_layers);
         let mut v_cache = Vec::with_capacity(num_layers);
 
-        // Pre-allocate all pages for all layers
+        // Pre-allocate all pages for all layers as separate tensors
         for _ in 0..num_layers {
-            let k = Tensor::zeros(
-                (total_pages, PAGE_SIZE, num_heads, head_dim),
-                dtype,
-                &device,
-            )?;
-            let v = Tensor::zeros(
-                (total_pages, PAGE_SIZE, num_heads, head_dim),
-                dtype,
-                &device,
-            )?;
-            k_cache.push(k);
-            v_cache.push(v);
+            let mut k_pages = Vec::with_capacity(total_pages);
+            let mut v_pages = Vec::with_capacity(total_pages);
+
+            for _ in 0..total_pages {
+                k_pages.push(Tensor::zeros(
+                    (PAGE_SIZE, num_heads, head_dim),
+                    dtype,
+                    &device,
+                )?);
+                v_pages.push(Tensor::zeros(
+                    (PAGE_SIZE, num_heads, head_dim),
+                    dtype,
+                    &device,
+                )?);
+            }
+
+            k_cache.push(k_pages);
+            v_cache.push(v_pages);
         }
 
         // Initialize free page pool (all pages available initially)
@@ -131,20 +138,12 @@ impl PagedKVCache {
             ));
         }
 
-        // Cache shape: [total_pages, PAGE_SIZE, num_heads, head_dim]
-        // k, v shape: [num_tokens, num_heads, head_dim]
+        // Get the specific page for this layer
+        let k_page = &self._k_cache[layer_idx][page_id];
+        let v_page = &self._v_cache[layer_idx][page_id];
 
-        // Get the current cache tensors
-        let k_cache = &self._k_cache[layer_idx];
-        let v_cache = &self._v_cache[layer_idx];
-
-        // Extract the page we're writing to
-        // Shape: [PAGE_SIZE, num_heads, head_dim]
-        let k_page = k_cache.i(page_id)?;
-        let v_page = v_cache.i(page_id)?;
-
-        // Create the updated page by concatenating:
-        // [existing before] + [new values] + [existing after]
+        // Build the new page by concatenating slices
+        // Only update the single page, not the entire cache
         let k_before = if token_offset > 0 {
             Some(k_page.narrow(0, 0, token_offset)?)
         } else {
@@ -167,7 +166,7 @@ impl PagedKVCache {
             None
         };
 
-        // Build the new page
+        // Build the new page tensors
         let new_k_page = match (k_before, k_after) {
             (Some(before), Some(after)) => Tensor::cat(&[&before, k, &after], 0)?,
             (Some(before), None) => Tensor::cat(&[&before, k], 0)?,
@@ -182,27 +181,9 @@ impl PagedKVCache {
             (None, None) => v.clone(),
         };
 
-        // Reconstruct the full cache with the updated page
-        // This is not the most efficient approach, but it works
-        // A better approach would use slice_scatter when available
-        let mut k_pages = Vec::with_capacity(self.total_pages);
-        let mut v_pages = Vec::with_capacity(self.total_pages);
-
-        for i in 0..self.total_pages {
-            if i == page_id {
-                k_pages.push(new_k_page.unsqueeze(0)?);
-                v_pages.push(new_v_page.unsqueeze(0)?);
-            } else {
-                k_pages.push(k_cache.i(i)?.unsqueeze(0)?);
-                v_pages.push(v_cache.i(i)?.unsqueeze(0)?);
-            }
-        }
-
-        let k_refs: Vec<&Tensor> = k_pages.iter().collect();
-        let v_refs: Vec<&Tensor> = v_pages.iter().collect();
-
-        self._k_cache[layer_idx] = Tensor::cat(&k_refs, 0)?;
-        self._v_cache[layer_idx] = Tensor::cat(&v_refs, 0)?;
+        // Update only this single page - no full cache rebuild!
+        self._k_cache[layer_idx][page_id] = new_k_page;
+        self._v_cache[layer_idx][page_id] = new_v_page;
 
         Ok(())
     }
@@ -242,7 +223,7 @@ impl PagedKVCache {
             return Ok((k, v));
         }
 
-        // Cache shape: [total_pages, PAGE_SIZE, num_heads, head_dim]
+        // Access pages directly from the Vec
         let k_cache = &self._k_cache[layer_idx];
         let v_cache = &self._v_cache[layer_idx];
 
@@ -261,9 +242,9 @@ impl PagedKVCache {
             let tokens_in_page = std::cmp::min(tokens_remaining, PAGE_SIZE);
 
             if tokens_in_page > 0 {
-                // Extract the page
-                let k_page = k_cache.i(page_id)?;
-                let v_page = v_cache.i(page_id)?;
+                // Access the page directly from the Vec
+                let k_page = &k_cache[page_id];
+                let v_page = &v_cache[page_id];
 
                 // Narrow to the tokens we need
                 let k_slice = k_page.narrow(0, 0, tokens_in_page)?;

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
-use crate::kv_cache::PagedKVCache;
+use crate::kv_cache::{PagedKVCache, PAGE_SIZE};
 use crate::model::{CausalLM, ModelConfig, load_model, create_logits_processor, EosToken};
 use crate::request::{InferenceRequest, RequestState, SamplingParams};
 use crate::scheduler::Scheduler;
@@ -56,6 +56,10 @@ pub struct BatchEngineStats {
 struct ActiveRequest {
     state: RequestState,
     logits_processor: candle_transformers::generation::LogitsProcessor,
+    /// KV cache pages allocated to this request
+    allocated_pages: Vec<usize>,
+    /// Current position in the sequence (for tracking page usage)
+    seq_position: usize,
 }
 
 /// Batched inference engine with continuous batching
@@ -134,6 +138,9 @@ impl BatchInferenceEngine {
             rid
         };
 
+        // Calculate prompt length before moving tokens
+        let prompt_len = tokens.len();
+
         // Create the request
         let (tx, _rx) = tokio::sync::oneshot::channel();
         let request = InferenceRequest {
@@ -154,12 +161,36 @@ impl BatchInferenceEngine {
         // Add to scheduler
         self.scheduler.add_request(request.clone());
 
+        // Allocate KV cache pages for this request
+        // Estimate pages needed: prompt_len / PAGE_SIZE + max_tokens / PAGE_SIZE
+        let max_tokens = params.max_tokens;
+        let total_tokens = prompt_len + max_tokens;
+        let pages_needed = (total_tokens + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        let mut allocated_pages = Vec::with_capacity(pages_needed);
+        {
+            let kv_cache = self.kv_cache.lock();
+            for _ in 0..pages_needed {
+                if let Some(page_id) = kv_cache.allocate_page() {
+                    allocated_pages.push(page_id);
+                } else {
+                    // Out of pages - free what we allocated and return error
+                    for &page_id in &allocated_pages {
+                        kv_cache.free_page(page_id);
+                    }
+                    return Err(anyhow!("Out of KV cache pages"));
+                }
+            }
+        }
+
         // Track in active requests
         {
             let mut active = self.active_requests.lock();
             active.insert(request_id, ActiveRequest {
                 state: RequestState::new(request),
                 logits_processor,
+                allocated_pages,
+                seq_position: 0,
             });
         }
 
@@ -223,14 +254,12 @@ impl BatchInferenceEngine {
         // Find max sequence length in this batch
         let max_len = batch_inputs.iter().map(|t| t.len()).max().unwrap_or(1);
 
-        // Pad sequences to same length and create batch tensor
-        let mut padded_batch = Vec::new();
+        // Optimized padding: pre-allocate and fill efficiently
+        let mut padded_batch = Vec::with_capacity(batch_size * max_len);
         for tokens in &batch_inputs {
-            let mut padded = tokens.clone();
-            while padded.len() < max_len {
-                padded.push(0); // Pad with 0
-            }
-            padded_batch.extend(padded);
+            padded_batch.extend_from_slice(tokens);
+            // Pad remaining with zeros
+            padded_batch.resize(padded_batch.len() + (max_len - tokens.len()), 0);
         }
 
         // Create batched input tensor [batch_size, seq_len]
@@ -240,12 +269,14 @@ impl BatchInferenceEngine {
         // Forward pass with batched input
         let logits = {
             let mut model = self.model.lock();
-            // Clear cache for batched processing (simple approach)
+            // For now, still clear cache for batched processing to avoid cache conflicts
+            // TODO: Properly implement per-request KV cache tracking with PagedKVCache
             model.clear_kv_cache();
             model.forward(&input, 0)?
         };
 
         // Process logits for each request in the batch
+        let mut finished_requests = Vec::new();
         let mut active = self.active_requests.lock();
         for (batch_idx, &request_id) in request_order.iter().enumerate() {
             if let Some(active_req) = active.get_mut(&request_id) {
@@ -298,9 +329,28 @@ impl BatchInferenceEngine {
                 generated_tokens.push((request_id, next_token));
 
                 if is_finished {
-                    let mut stats = self.stats.lock();
-                    stats.completed_requests += 1;
+                    // Collect pages to free later
+                    finished_requests.push((request_id, active_req.allocated_pages.clone()));
                 }
+            }
+        }
+        drop(active); // Release lock
+
+        // Clean up finished requests
+        if !finished_requests.is_empty() {
+            // Free KV cache pages
+            let kv_cache = self.kv_cache.lock();
+            for (_, pages) in &finished_requests {
+                kv_cache.free_pages(pages);
+            }
+            drop(kv_cache);
+
+            // Remove from active requests and update stats
+            let mut active = self.active_requests.lock();
+            let mut stats = self.stats.lock();
+            for (request_id, _) in finished_requests {
+                active.remove(&request_id);
+                stats.completed_requests += 1;
             }
         }
 
