@@ -206,6 +206,10 @@ impl BatchInferenceEngine {
 
     /// Process one step of batched inference
     /// Returns list of (request_id, generated_token, is_finished) tuples
+    ///
+    /// OPTIMIZATION: Separates prefill and decode phases for efficiency
+    /// - Prefill: Process one request at a time (variable length prompts)
+    /// - Decode: Batch all decode requests together (all have 1 token, no padding needed)
     pub fn step(&self) -> Result<Vec<(u64, u32, bool)>> {
         // Get next batch from scheduler
         let batch = match self.scheduler.get_next_batch() {
@@ -216,127 +220,73 @@ impl BatchInferenceEngine {
         let batch_size = batch.request_ids.len();
         debug!("Processing batch with {} requests", batch_size);
 
-        // TRUE BATCHING: Process all requests together
+        // PHASE 1: Separate prefill and decode requests
+        let mut prefill_requests = Vec::new();
+        let mut decode_requests = Vec::new();
+
+        {
+            let active = self.active_requests.lock();
+            for &request_id in &batch.request_ids {
+                if let Some(active_req) = active.get(&request_id) {
+                    if active_req.state.is_prefill {
+                        prefill_requests.push(request_id);
+                    } else {
+                        decode_requests.push(request_id);
+                    }
+                }
+            }
+        }
+
         let mut results = Vec::new();
         let mut generated_tokens = Vec::new();
 
-        // Collect input tokens and metadata for all requests in batch
-        let mut batch_inputs = Vec::new();
-        let mut request_order = Vec::new();
-
-        {
-            let mut active = self.active_requests.lock();
-            for &request_id in &batch.request_ids {
-                if let Some(active_req) = active.get_mut(&request_id) {
-                    let state = &mut active_req.state;
-
-                    // Determine input tokens for this request
-                    let input_tokens = if state.is_prefill {
-                        state.request.tokens.clone()
-                    } else {
-                        // Decode phase - use last generated token
-                        vec![state.generated_tokens.last()
-                            .or(state.request.tokens.last())
-                            .copied()
-                            .unwrap_or(0)]
-                    };
-
-                    batch_inputs.push(input_tokens);
-                    request_order.push(request_id);
-                }
+        // PHASE 2: Process prefill requests one at a time (they have variable lengths)
+        // This uses the model's KV cache efficiently for each request
+        for request_id in prefill_requests {
+            if let Some((token, is_finished)) = self.process_prefill_request(request_id)? {
+                results.push((request_id, token, is_finished));
+                generated_tokens.push((request_id, token));
             }
         }
 
-        if batch_inputs.is_empty() {
-            return Ok(vec![]);
-        }
+        // PHASE 3: Process decode requests efficiently
+        // OPTIMIZATION: Process one request at a time to leverage KV cache
+        // Prioritize current cache owner to maximize cache hits
+        if !decode_requests.is_empty() {
+            // Sort to prioritize cache owner
+            let cache_owner = *self.current_cache_owner.lock();
+            let mut sorted_requests = decode_requests.clone();
+            if let Some(owner) = cache_owner {
+                // Move cache owner to front
+                if let Some(pos) = sorted_requests.iter().position(|&id| id == owner) {
+                    sorted_requests.remove(pos);
+                    sorted_requests.insert(0, owner);
+                }
+            }
 
-        // Find max sequence length in this batch
-        let max_len = batch_inputs.iter().map(|t| t.len()).max().unwrap_or(1);
-
-        // Optimized padding: pre-allocate and fill efficiently
-        let mut padded_batch = Vec::with_capacity(batch_size * max_len);
-        for tokens in &batch_inputs {
-            padded_batch.extend_from_slice(tokens);
-            // Pad remaining with zeros
-            padded_batch.resize(padded_batch.len() + (max_len - tokens.len()), 0);
-        }
-
-        // Create batched input tensor [batch_size, seq_len]
-        let input = Tensor::new(&padded_batch[..], &self.device)?
-            .reshape(&[batch_size, max_len])?;
-
-        // Forward pass with batched input
-        let logits = {
-            let mut model = self.model.lock();
-            // For now, still clear cache for batched processing to avoid cache conflicts
-            // TODO: Properly implement per-request KV cache tracking with PagedKVCache
-            model.clear_kv_cache();
-            model.forward(&input, 0)?
-        };
-
-        // Process logits for each request in the batch
-        let mut finished_requests = Vec::new();
-        let mut active = self.active_requests.lock();
-        for (batch_idx, &request_id) in request_order.iter().enumerate() {
-            if let Some(active_req) = active.get_mut(&request_id) {
-                // Extract logits for this batch element
-                let req_logits = logits.get(batch_idx)?;
-
-                // Get last token logits
-                let last_logits = if req_logits.dims().len() > 1 {
-                    req_logits.get(req_logits.dims()[0] - 1)?
-                } else {
-                    req_logits.clone()
-                };
-
-                // Apply repeat penalty
-                let penalized_logits = if self.config.repeat_penalty != 1.0 {
-                    let all_tokens: Vec<u32> = active_req.state.request.tokens.iter()
-                        .chain(active_req.state.generated_tokens.iter())
-                        .copied()
-                        .collect();
-                    let start_at = all_tokens.len().saturating_sub(self.config.repeat_last_n);
-                    candle_transformers::utils::apply_repeat_penalty(
-                        &last_logits,
-                        self.config.repeat_penalty,
-                        &all_tokens[start_at..],
-                    )?
-                } else {
-                    last_logits
-                };
-
-                // Sample next token
-                let next_token = active_req.logits_processor.sample(&penalized_logits)?;
-
-                // Check if finished
-                let is_eos = if let Some(eos) = &self.eos_token_id {
-                    eos.contains(next_token)
-                } else {
-                    false
-                };
-
-                let max_tokens_reached = active_req.state.generated_tokens.len()
-                    >= active_req.state.request.params.max_tokens;
-
-                let is_finished = is_eos || max_tokens_reached;
-
-                // Update state
-                active_req.state.generated_tokens.push(next_token);
-                active_req.state.is_prefill = false;
-
-                results.push((request_id, next_token, is_finished));
-                generated_tokens.push((request_id, next_token));
-
-                if is_finished {
-                    // Collect pages to free later
-                    finished_requests.push((request_id, active_req.allocated_pages.clone()));
+            // Process ONE decode request per step to maximize KV cache benefit
+            // This gives each request multiple consecutive steps to leverage cache
+            if let Some(&request_id) = sorted_requests.first() {
+                if let Some((token, is_finished)) = self.process_decode_single(request_id)? {
+                    results.push((request_id, token, is_finished));
+                    generated_tokens.push((request_id, token));
                 }
             }
         }
-        drop(active); // Release lock
 
         // Clean up finished requests
+        let mut finished_requests = Vec::new();
+        {
+            let active = self.active_requests.lock();
+            for &(request_id, _, is_finished) in &results {
+                if is_finished {
+                    if let Some(active_req) = active.get(&request_id) {
+                        finished_requests.push((request_id, active_req.allocated_pages.clone()));
+                    }
+                }
+            }
+        }
+
         if !finished_requests.is_empty() {
             // Free KV cache pages
             let kv_cache = self.kv_cache.lock();
@@ -362,6 +312,421 @@ impl BatchInferenceEngine {
             let mut stats = self.stats.lock();
             stats.total_tokens_generated += results.len() as u64;
             stats.current_batch_size = batch_size;
+        }
+
+        Ok(results)
+    }
+
+    /// Process a prefill request (prompt processing)
+    /// Uses the model's internal KV cache for efficient attention
+    fn process_prefill_request(&self, request_id: u64) -> Result<Option<(u32, bool)>> {
+        let mut active = self.active_requests.lock();
+        let active_req = match active.get_mut(&request_id) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let state = &mut active_req.state;
+
+        // Get all prompt tokens
+        let input_tokens = state.request.tokens.clone();
+        if input_tokens.is_empty() {
+            return Err(anyhow!("Empty prompt tokens"));
+        }
+
+        // Create input tensor [1, seq_len]
+        let input = Tensor::new(&input_tokens[..], &self.device)?.unsqueeze(0)?;
+
+        // Forward pass - clear cache for new prefill
+        let logits = {
+            let mut model = self.model.lock();
+            model.clear_kv_cache();
+            model.forward(&input, 0)?
+        };
+
+        // Update cache owner to this request
+        *self.current_cache_owner.lock() = Some(request_id);
+
+        // Get last token logits
+        let logits = logits.squeeze(0)?;
+        let last_logits = if logits.dims().len() > 1 {
+            logits.get(logits.dims()[0] - 1)?
+        } else {
+            logits
+        };
+
+        // Apply repeat penalty
+        let penalized_logits = if self.config.repeat_penalty != 1.0 {
+            let start_at = input_tokens.len().saturating_sub(self.config.repeat_last_n);
+            candle_transformers::utils::apply_repeat_penalty(
+                &last_logits,
+                self.config.repeat_penalty,
+                &input_tokens[start_at..],
+            )?
+        } else {
+            last_logits
+        };
+
+        // Sample next token
+        let next_token = active_req.logits_processor.sample(&penalized_logits)?;
+
+        // Check if finished
+        let is_eos = self.eos_token_id.as_ref()
+            .map(|eos| eos.contains(next_token))
+            .unwrap_or(false);
+        let is_max_tokens = state.generated_tokens.len() + 1 >= state.request.params.max_tokens;
+        let is_finished = is_eos || is_max_tokens;
+
+        // Update state - mark prefill as done
+        state.generated_tokens.push(next_token);
+        state.is_prefill = false;
+
+        Ok(Some((next_token, is_finished)))
+    }
+
+    /// Process a single decode request, leveraging KV cache if available
+    fn process_decode_single(&self, request_id: u64) -> Result<Option<(u32, bool)>> {
+        let mut active = self.active_requests.lock();
+        let active_req = match active.get_mut(&request_id) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        // Check if this request owns the current cache
+        let mut cache_owner = self.current_cache_owner.lock();
+        let can_use_cache = *cache_owner == Some(request_id);
+
+        let (input_tokens, seq_offset) = if can_use_cache {
+            // Cache hit! Only need to process the last generated token
+            let last_token = active_req.state.generated_tokens.last()
+                .or(active_req.state.request.tokens.last())
+                .copied()
+                .unwrap_or(0);
+            let offset = active_req.state.request.tokens.len()
+                + active_req.state.generated_tokens.len() - 1;
+            (vec![last_token], offset)
+        } else {
+            // Cache miss - need to replay full context
+            let mut context: Vec<u32> = active_req.state.request.tokens.clone();
+            context.extend(active_req.state.generated_tokens.iter().copied());
+            (context, 0)
+        };
+
+        // Create input tensor
+        let input = Tensor::new(&input_tokens[..], &self.device)?.unsqueeze(0)?;
+
+        // Forward pass
+        let logits = {
+            let mut model = self.model.lock();
+            if !can_use_cache {
+                model.clear_kv_cache();
+            }
+            model.forward(&input, seq_offset)?
+        };
+
+        // Update cache owner
+        *cache_owner = Some(request_id);
+        drop(cache_owner);
+
+        // Get last token logits
+        let logits = logits.squeeze(0)?;
+        let last_logits = if logits.dims().len() > 1 {
+            logits.get(logits.dims()[0] - 1)?
+        } else {
+            logits
+        };
+
+        // Apply repeat penalty
+        let all_tokens: Vec<u32> = active_req.state.request.tokens.iter()
+            .chain(active_req.state.generated_tokens.iter())
+            .copied()
+            .collect();
+
+        let penalized_logits = if self.config.repeat_penalty != 1.0 {
+            let start_at = all_tokens.len().saturating_sub(self.config.repeat_last_n);
+            candle_transformers::utils::apply_repeat_penalty(
+                &last_logits,
+                self.config.repeat_penalty,
+                &all_tokens[start_at..],
+            )?
+        } else {
+            last_logits
+        };
+
+        // Sample next token
+        let next_token = active_req.logits_processor.sample(&penalized_logits)?;
+
+        // Check if finished
+        let is_eos = self.eos_token_id.as_ref()
+            .map(|eos| eos.contains(next_token))
+            .unwrap_or(false);
+        let is_max_tokens = active_req.state.generated_tokens.len() + 1
+            >= active_req.state.request.params.max_tokens;
+        let is_finished = is_eos || is_max_tokens;
+
+        // Update state
+        active_req.state.generated_tokens.push(next_token);
+
+        Ok(Some((next_token, is_finished)))
+    }
+
+    /// Process decode requests sequentially, using KV cache for efficiency
+    /// When processing the same request consecutively, we can use the cached KV state
+    #[allow(dead_code)]
+    fn process_decode_sequential(&self, request_ids: &[u64]) -> Result<Vec<(u64, u32, bool)>> {
+        let mut results = Vec::with_capacity(request_ids.len());
+
+        for &request_id in request_ids {
+            let mut active = self.active_requests.lock();
+            let active_req = match active.get_mut(&request_id) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // Check if this request owns the current cache
+            let mut cache_owner = self.current_cache_owner.lock();
+            let can_use_cache = *cache_owner == Some(request_id);
+
+            let (input_tokens, seq_offset) = if can_use_cache {
+                // Cache is valid - only need to process the last generated token
+                let last_token = active_req.state.generated_tokens.last()
+                    .or(active_req.state.request.tokens.last())
+                    .copied()
+                    .unwrap_or(0);
+                let offset = active_req.state.request.tokens.len()
+                    + active_req.state.generated_tokens.len() - 1;
+                (vec![last_token], offset)
+            } else {
+                // Cache miss - need to replay full context
+                let mut context: Vec<u32> = active_req.state.request.tokens.clone();
+                context.extend(active_req.state.generated_tokens.iter().copied());
+                (context, 0)
+            };
+
+            // Create input tensor
+            let input = Tensor::new(&input_tokens[..], &self.device)?.unsqueeze(0)?;
+
+            // Forward pass
+            let logits = {
+                let mut model = self.model.lock();
+                if !can_use_cache {
+                    model.clear_kv_cache();
+                }
+                model.forward(&input, seq_offset)?
+            };
+
+            // Update cache owner
+            *cache_owner = Some(request_id);
+            drop(cache_owner);
+
+            // Get last token logits
+            let logits = logits.squeeze(0)?;
+            let last_logits = if logits.dims().len() > 1 {
+                logits.get(logits.dims()[0] - 1)?
+            } else {
+                logits
+            };
+
+            // Apply repeat penalty
+            let all_tokens: Vec<u32> = active_req.state.request.tokens.iter()
+                .chain(active_req.state.generated_tokens.iter())
+                .copied()
+                .collect();
+
+            let penalized_logits = if self.config.repeat_penalty != 1.0 {
+                let start_at = all_tokens.len().saturating_sub(self.config.repeat_last_n);
+                candle_transformers::utils::apply_repeat_penalty(
+                    &last_logits,
+                    self.config.repeat_penalty,
+                    &all_tokens[start_at..],
+                )?
+            } else {
+                last_logits
+            };
+
+            // Sample next token
+            let next_token = active_req.logits_processor.sample(&penalized_logits)?;
+
+            // Check if finished
+            let is_eos = self.eos_token_id.as_ref()
+                .map(|eos| eos.contains(next_token))
+                .unwrap_or(false);
+            let is_max_tokens = active_req.state.generated_tokens.len() + 1
+                >= active_req.state.request.params.max_tokens;
+            let is_finished = is_eos || is_max_tokens;
+
+            // Update state
+            active_req.state.generated_tokens.push(next_token);
+
+            results.push((request_id, next_token, is_finished));
+        }
+
+        Ok(results)
+    }
+
+    /// Process a single decode request with full context replay
+    /// This maintains output quality by providing the full history
+    #[allow(dead_code)]
+    fn process_decode_request(&self, request_id: u64) -> Result<Option<(u32, bool)>> {
+        let mut active = self.active_requests.lock();
+        let active_req = match active.get_mut(&request_id) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        // Build full context: prompt + all generated tokens so far
+        let mut context: Vec<u32> = active_req.state.request.tokens.clone();
+        context.extend(active_req.state.generated_tokens.iter().copied());
+
+        // Create input tensor [1, seq_len]
+        let input = Tensor::new(&context[..], &self.device)?.unsqueeze(0)?;
+
+        // Forward pass
+        let logits = {
+            let mut model = self.model.lock();
+            model.clear_kv_cache();
+            model.forward(&input, 0)?
+        };
+
+        // Get last token logits
+        let logits = logits.squeeze(0)?;
+        let last_logits = if logits.dims().len() > 1 {
+            logits.get(logits.dims()[0] - 1)?
+        } else {
+            logits
+        };
+
+        // Apply repeat penalty
+        let penalized_logits = if self.config.repeat_penalty != 1.0 {
+            let start_at = context.len().saturating_sub(self.config.repeat_last_n);
+            candle_transformers::utils::apply_repeat_penalty(
+                &last_logits,
+                self.config.repeat_penalty,
+                &context[start_at..],
+            )?
+        } else {
+            last_logits
+        };
+
+        // Sample next token
+        let next_token = active_req.logits_processor.sample(&penalized_logits)?;
+
+        // Check if finished
+        let is_eos = self.eos_token_id.as_ref()
+            .map(|eos| eos.contains(next_token))
+            .unwrap_or(false);
+        let is_max_tokens = active_req.state.generated_tokens.len() + 1
+            >= active_req.state.request.params.max_tokens;
+        let is_finished = is_eos || is_max_tokens;
+
+        // Update state
+        active_req.state.generated_tokens.push(next_token);
+
+        Ok(Some((next_token, is_finished)))
+    }
+
+    /// Process a batch of decode requests (EXPERIMENTAL - may have quality issues)
+    /// Each request needs its full context (prompt + generated tokens) for quality
+    #[allow(dead_code)]
+    fn process_decode_batch(&self, request_ids: &[u64]) -> Result<Vec<(u64, u32, bool)>> {
+        let batch_size = request_ids.len();
+        if batch_size == 0 {
+            return Ok(vec![]);
+        }
+
+        // Collect full context for each request (prompt + all generated tokens)
+        let mut batch_contexts: Vec<Vec<u32>> = Vec::with_capacity(batch_size);
+        let mut request_order = Vec::with_capacity(batch_size);
+
+        {
+            let active = self.active_requests.lock();
+            for &request_id in request_ids {
+                if let Some(active_req) = active.get(&request_id) {
+                    // Full context = prompt + all generated tokens so far
+                    let mut context: Vec<u32> = active_req.state.request.tokens.clone();
+                    context.extend(active_req.state.generated_tokens.iter().copied());
+                    batch_contexts.push(context);
+                    request_order.push(request_id);
+                }
+            }
+        }
+
+        if batch_contexts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Find max context length and pad
+        let max_len = batch_contexts.iter().map(|c| c.len()).max().unwrap_or(1);
+
+        // Create padded batch tensor
+        let mut padded_batch = Vec::with_capacity(batch_size * max_len);
+        for context in &batch_contexts {
+            padded_batch.extend_from_slice(context);
+            // Pad remaining with zeros
+            padded_batch.resize(padded_batch.len() + (max_len - context.len()), 0);
+        }
+
+        // Create batched input tensor [batch_size, max_len]
+        let input = Tensor::new(&padded_batch[..], &self.device)?
+            .reshape(&[batch_size, max_len])?;
+
+        // Forward pass with full context
+        let logits = {
+            let mut model = self.model.lock();
+            model.clear_kv_cache();
+            model.forward(&input, 0)?
+        };
+
+        // Process results for each request
+        let mut results = Vec::with_capacity(batch_size);
+        let mut active = self.active_requests.lock();
+
+        for (batch_idx, &request_id) in request_order.iter().enumerate() {
+            if let Some(active_req) = active.get_mut(&request_id) {
+                // Extract logits for this batch element
+                let req_logits = logits.get(batch_idx)?;
+
+                // Get logits at the last actual token position (not padding)
+                let context_len = batch_contexts[batch_idx].len();
+                let last_logits = if req_logits.dims().len() > 1 {
+                    // Shape is [seq_len, vocab_size], get last real position
+                    req_logits.get(context_len - 1)?
+                } else {
+                    req_logits
+                };
+
+                // Apply repeat penalty
+                let penalized_logits = if self.config.repeat_penalty != 1.0 {
+                    let all_tokens: Vec<u32> = active_req.state.request.tokens.iter()
+                        .chain(active_req.state.generated_tokens.iter())
+                        .copied()
+                        .collect();
+                    let start_at = all_tokens.len().saturating_sub(self.config.repeat_last_n);
+                    candle_transformers::utils::apply_repeat_penalty(
+                        &last_logits,
+                        self.config.repeat_penalty,
+                        &all_tokens[start_at..],
+                    )?
+                } else {
+                    last_logits
+                };
+
+                // Sample next token
+                let next_token = active_req.logits_processor.sample(&penalized_logits)?;
+
+                // Check if finished
+                let is_eos = self.eos_token_id.as_ref()
+                    .map(|eos| eos.contains(next_token))
+                    .unwrap_or(false);
+                let is_max_tokens = active_req.state.generated_tokens.len() + 1
+                    >= active_req.state.request.params.max_tokens;
+                let is_finished = is_eos || is_max_tokens;
+
+                // Update state
+                active_req.state.generated_tokens.push(next_token);
+
+                results.push((request_id, next_token, is_finished));
+            }
         }
 
         Ok(results)

@@ -12,8 +12,22 @@ fn main() -> Result<()> {
     println!("Forge - Batched LLM Inference Engine");
     println!("=====================================\n");
 
-    // Create engine config
-    let model_config = ModelConfig::smollm_135m();
+    // Auto-detect device: CUDA if available, otherwise CPU
+    let device = if cfg!(feature = "cuda") {
+        candle_core::Device::cuda_if_available(0).unwrap_or(candle_core::Device::Cpu)
+    } else {
+        candle_core::Device::Cpu
+    };
+    let is_gpu = matches!(device, candle_core::Device::Cuda(_));
+
+    // Create engine config with proper flash attention setting
+    let model_config = ModelConfig {
+        model_id: "HuggingFaceTB/SmolLM2-135M".to_string(),
+        revision: "main".to_string(),
+        dtype: if is_gpu { candle_core::DType::F16 } else { candle_core::DType::F32 },
+        use_flash_attn: is_gpu && cfg!(feature = "flash-attn"),
+    };
+
     let engine_config = BatchEngineConfig {
         model_config,
         num_kv_pages: 128,
@@ -22,8 +36,10 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    println!("Device: {}", if is_gpu { "CUDA GPU" } else { "CPU" });
+    println!("Flash Attention: {}\n", engine_config.model_config.use_flash_attn);
     println!("Loading model...");
-    let engine = BatchInferenceEngine::new(engine_config, candle_core::Device::Cpu)?;
+    let engine = BatchInferenceEngine::new(engine_config, device)?;
     println!("Model loaded!\n");
 
     // Define prompts for batched generation
